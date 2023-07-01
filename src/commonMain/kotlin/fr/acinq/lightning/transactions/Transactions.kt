@@ -61,6 +61,9 @@ object Transactions {
             }
 
         @Serializable
+        data class SpliceTx(override val input: InputInfo, @Contextual override val tx: Transaction) : TransactionWithInputInfo()
+
+        @Serializable
         data class CommitTx(override val input: InputInfo, @Contextual override val tx: Transaction) : TransactionWithInputInfo()
 
         @Serializable
@@ -104,9 +107,7 @@ object Transactions {
 
         @Serializable
         sealed class ClaimRemoteCommitMainOutputTx : TransactionWithInputInfo() {
-            @Serializable
-            data class ClaimP2WPKHOutputTx(override val input: InputInfo, @Contextual override val tx: Transaction) : ClaimRemoteCommitMainOutputTx()
-
+            // TODO: once we deprecate v2/v3 serialization, we can remove the class nesting.
             @Serializable
             data class ClaimRemoteDelayedOutputTx(override val input: InputInfo, @Contextual override val tx: Transaction) : ClaimRemoteCommitMainOutputTx()
         }
@@ -158,7 +159,7 @@ object Transactions {
      *     - [[ClaimDelayedOutputPenaltyTx]] spends [[HtlcTimeoutTx]] using the revocation secret (published by local)
      *   - [[HtlcPenaltyTx]] spends competes with [[HtlcSuccessTx]] and [[HtlcTimeoutTx]] for the same outputs (published by local)
      */
-    const val p2wpkhInputWeight = 275
+    const val swapInputWeight = 392
 
     // The following values are specific to lightning and used to estimate fees.
     const val claimP2WPKHOutputWeight = 438
@@ -538,45 +539,6 @@ object Transactions {
             ?: TxResult.Skipped(TxGenerationSkipped.OutputNotFound)
     }
 
-    fun makeClaimP2WPKHOutputTx(
-        delayedOutputTx: Transaction,
-        localDustLimit: Satoshi,
-        localPaymentPubkey: PublicKey,
-        localFinalScriptPubKey: ByteArray,
-        feerate: FeeratePerKw
-    ): TxResult<TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx> {
-        val redeemScript = Script.pay2pkh(localPaymentPubkey)
-        val pubkeyScript = Script.write(Script.pay2wpkh(localPaymentPubkey))
-        return when (val pubkeyScriptIndex = findPubKeyScriptIndex(delayedOutputTx, pubkeyScript)) {
-            is TxResult.Skipped -> TxResult.Skipped(pubkeyScriptIndex.why)
-            is TxResult.Success -> {
-                val outputIndex = pubkeyScriptIndex.result
-                val input = InputInfo(
-                    OutPoint(delayedOutputTx, outputIndex.toLong()),
-                    delayedOutputTx.txOut[outputIndex],
-                    ByteVector(Script.write(redeemScript))
-                )
-                // unsigned tx
-                val tx = Transaction(
-                    version = 2,
-                    txIn = listOf(TxIn(input.outPoint, ByteVector.empty, 0x00000000L)),
-                    txOut = listOf(TxOut(0.sat, localFinalScriptPubKey)),
-                    lockTime = 0
-                )
-                // compute weight with a dummy 73 bytes signature (the largest you can get) and a dummy 33 bytes pubkey
-                val weight = addSigs(TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx(input, tx), PlaceHolderPubKey, PlaceHolderSig).tx.weight()
-                val fee = weight2fee(feerate, weight)
-                val amount = input.txOut.amount - fee
-                if (amount < localDustLimit) {
-                    TxResult.Skipped(TxGenerationSkipped.AmountBelowDustLimit)
-                } else {
-                    val tx1 = tx.copy(txOut = listOf(tx.txOut.first().copy(amount = amount)))
-                    TxResult.Success(TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx(input, tx1))
-                }
-            }
-        }
-    }
-
     fun makeClaimRemoteDelayedOutputTx(
         commitTx: Transaction, localDustLimit: Satoshi,
         localPaymentPubkey: PublicKey,
@@ -823,9 +785,22 @@ object Transactions {
         return Crypto.der2compact(sigDER)
     }
 
-    fun sign(txinfo: TransactionWithInputInfo, key: PrivateKey, sigHash: Int = SigHash.SIGHASH_ALL): ByteVector64 {
-        require(txinfo.tx.txIn.size == 1) { "only one input allowed" }
-        return sign(txinfo.tx, 0, txinfo.input.redeemScript.toByteArray(), txinfo.input.txOut.amount, key, sigHash)
+    fun sign(txInfo: TransactionWithInputInfo, key: PrivateKey, sigHash: Int = SigHash.SIGHASH_ALL): ByteVector64 {
+        val inputIndex = txInfo.tx.txIn.indexOfFirst { it.outPoint == txInfo.input.outPoint }
+        require(inputIndex >= 0) { "transaction doesn't spend the input to sign" }
+        return sign(txInfo.tx, inputIndex, txInfo.input.redeemScript.toByteArray(), txInfo.input.txOut.amount, key, sigHash)
+    }
+
+    /** Sign an input from a 2-of-2 swap-in address with the swap user's key. */
+    fun signSwapInputUser(fundingTx: Transaction, index: Int, parentTxOut: TxOut, userKey: PrivateKey, serverKey: PublicKey, refundDelay: Int): ByteVector64 {
+        val redeemScript = Scripts.swapIn2of2(userKey.publicKey(), serverKey, refundDelay)
+        return sign(fundingTx, index, Script.write(redeemScript), parentTxOut.amount, userKey)
+    }
+
+    /** Sign an input from a 2-of-2 swap-in address with the swap server's key. */
+    fun signSwapInputServer(fundingTx: Transaction, index: Int, parentTxOut: TxOut, userKey: PublicKey, serverKey: PrivateKey, refundDelay: Int): ByteVector64 {
+        val redeemScript = Scripts.swapIn2of2(userKey, serverKey.publicKey(), refundDelay)
+        return sign(fundingTx, index, Script.write(redeemScript), parentTxOut.amount, serverKey)
     }
 
     fun addSigs(
@@ -867,15 +842,6 @@ object Transactions {
     fun addSigs(claimHtlcTimeoutTx: TransactionWithInputInfo.ClaimHtlcTx.ClaimHtlcTimeoutTx, localSig: ByteVector64): TransactionWithInputInfo.ClaimHtlcTx.ClaimHtlcTimeoutTx {
         val witness = Scripts.witnessClaimHtlcTimeoutFromCommitTx(localSig, claimHtlcTimeoutTx.input.redeemScript)
         return claimHtlcTimeoutTx.copy(tx = claimHtlcTimeoutTx.tx.updateWitness(0, witness))
-    }
-
-    fun addSigs(
-        claimP2WPKHOutputTx: TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx,
-        localPaymentPubkey: PublicKey,
-        localSig: ByteVector64
-    ): TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx {
-        val witness = ScriptWitness(listOf(Scripts.der(localSig, SigHash.SIGHASH_ALL), localPaymentPubkey.value))
-        return claimP2WPKHOutputTx.copy(tx = claimP2WPKHOutputTx.tx.updateWitness(0, witness))
     }
 
     fun addSigs(claimRemoteDelayed: TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimRemoteDelayedOutputTx, localSig: ByteVector64): TransactionWithInputInfo.ClaimRemoteCommitMainOutputTx.ClaimRemoteDelayedOutputTx {

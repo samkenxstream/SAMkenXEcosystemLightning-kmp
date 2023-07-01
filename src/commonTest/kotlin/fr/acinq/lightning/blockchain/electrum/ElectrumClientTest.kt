@@ -1,27 +1,19 @@
 package fr.acinq.lightning.blockchain.electrum
 
-import fr.acinq.bitcoin.ByteVector32
-import fr.acinq.bitcoin.Crypto
-import fr.acinq.bitcoin.Transaction
-import fr.acinq.bitcoin.byteVector32
+import fr.acinq.bitcoin.*
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
-import fr.acinq.lightning.io.TcpSocket
 import fr.acinq.lightning.tests.utils.LightningTestSuite
 import fr.acinq.lightning.tests.utils.runSuspendTest
 import fr.acinq.lightning.utils.Connection
-import fr.acinq.lightning.utils.ServerAddress
-import fr.acinq.lightning.utils.UUID
 import fr.acinq.lightning.utils.toByteVector32
 import fr.acinq.secp256k1.Hex
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.FlowPreview
-import kotlinx.coroutines.channels.ReceiveChannel
-import kotlinx.coroutines.flow.*
-import org.kodein.log.LoggerFactory
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
 import kotlin.test.*
 import kotlin.time.Duration.Companion.seconds
 
-@OptIn(FlowPreview::class)
 class ElectrumClientTest : LightningTestSuite() {
     // this is tx #2690 of block #500000
     private val referenceTx =
@@ -45,186 +37,113 @@ class ElectrumClientTest : LightningTestSuite() {
     )
         .map { it.toByteVector32() }
 
-    @Test
-    fun `connect to an electrumx mainnet server`() = runSuspendTest(timeout = 15.seconds) { connectToMainnetServer().stop() }
-
-    @Test
-    fun `estimate fees`() = runSuspendTest(timeout = 15.seconds) {
+    private fun runTest(test: suspend CoroutineScope.(ElectrumClient) -> Unit) = runSuspendTest(timeout = 15.seconds) {
         val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
 
-        caller.sendElectrumRequest(EstimateFees(3))
+        client.connectionState.first { it is Connection.CLOSED }
+        client.connectionState.first { it is Connection.ESTABLISHING }
+        client.connectionState.first { it is Connection.ESTABLISHED }
 
-        notifications.consumerCheck<EstimateFeeResponse> { message ->
-            assertTrue { message.feerate!! >= FeeratePerKw.MinimumFeeratePerKw }
-        }
+        test(client)
+    }
 
+    @Test
+    fun `connect to an electrumx mainnet server`() = runTest { client ->
         client.stop()
     }
 
     @Test
-    fun `get transaction id from position`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(GetTransactionIdFromPosition(height, position))
-
-        notifications.consumerCheck<GetTransactionIdFromPositionResponse> { message ->
-            assertEquals(GetTransactionIdFromPositionResponse(referenceTx.txid, height, position), message)
-        }
-
+    fun `estimate fees`() = runTest { client ->
+        val response = client.estimateFees(3)
+        assertTrue { response.feerate!! >= FeeratePerKw.MinimumFeeratePerKw }
         client.stop()
     }
 
     @Test
-    fun `get transaction id from position with merkle proof`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(GetTransactionIdFromPosition(height, position, true))
-
-        notifications.consumerCheck<GetTransactionIdFromPositionResponse> { message ->
-            assertEquals(GetTransactionIdFromPositionResponse(referenceTx.txid, height, position, merkleProof), message)
-        }
-
+    fun `get transaction id from position`() = runTest { client ->
+        val response = client.rpcCall<GetTransactionIdFromPositionResponse>(GetTransactionIdFromPosition(height, position))
+        assertEquals(GetTransactionIdFromPositionResponse(referenceTx.txid, height, position), response)
         client.stop()
     }
 
     @Test
-    fun `get transaction`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(GetTransaction(referenceTx.txid))
-
-        notifications.consumerCheck<GetTransactionResponse> { message ->
-            assertEquals(referenceTx, message.tx)
-        }
-
+    fun `get transaction id from position with merkle proof`() = runTest { client ->
+        val response = client.rpcCall<GetTransactionIdFromPositionResponse>(GetTransactionIdFromPosition(height, position, merkle = true))
+        assertEquals(GetTransactionIdFromPositionResponse(referenceTx.txid, height, position, merkleProof), response)
         client.stop()
     }
 
     @Test
-    fun `get header`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(GetHeader(100000))
-
-        notifications.consumerCheck<GetHeaderResponse> { message ->
-            assertEquals(
-                Hex.decode("000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506").byteVector32(),
-                message.header.blockId
-            )
-        }
-
+    fun `get transaction`() = runTest { client ->
+        val tx = client.getTx(referenceTx.txid)
+        assertEquals(referenceTx, tx)
         client.stop()
     }
 
     @Test
-    fun `get headers`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
+    fun `get header`() = runTest { client ->
+        val response = client.rpcCall<GetHeaderResponse>(GetHeader(100000))
+        assertEquals(
+            Hex.decode("000000000003ba27aa200b1cecaad478d2b00432346c3f1f3986da1afd33e506").byteVector32(),
+            response.header.blockId
+        )
+        client.stop()
+    }
 
+    @Test
+    fun `get headers`() = runTest { client ->
         val start = (500000 / 2016) * 2016
-        caller.sendElectrumRequest(GetHeaders(start, 2016))
+        val response = client.rpcCall<GetHeadersResponse>(GetHeaders(start, 2016))
+        assertEquals(start, response.start_height)
+        assertEquals(2016, response.headers.size)
+        client.stop()
+    }
 
-        notifications.consumerCheck<GetHeadersResponse> { message ->
-            assertEquals(start, message.start_height)
-            assertEquals(2016, message.headers.size)
-        }
+    @Test
+    fun `get merkle tree`() = runTest { client ->
+        val merkle = client.getMerkle(referenceTx.txid, 500000)
+
+        assertEquals(referenceTx.txid, merkle.txid)
+        assertEquals(500000, merkle.block_height)
+        assertEquals(2690, merkle.pos)
+        assertEquals(
+            Hex.decode("1f6231ed3de07345b607ec2a39b2d01bec2fe10dfb7f516ba4958a42691c9531").byteVector32(),
+            merkle.root
+        )
 
         client.stop()
     }
 
     @Test
-    fun `get merkle tree`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(GetMerkle(referenceTx.txid, 500000))
-
-        notifications.consumerCheck<GetMerkleResponse> { message ->
-            assertEquals(referenceTx.txid, message.txid)
-            assertEquals(500000, message.block_height)
-            assertEquals(2690, message.pos)
-            assertEquals(
-                Hex.decode("1f6231ed3de07345b607ec2a39b2d01bec2fe10dfb7f516ba4958a42691c9531").byteVector32(),
-                message.root
-            )
-        }
-
+    fun `header subscription`() = runTest { client ->
+        val response = client.startHeaderSubscription()
+        require(BlockHeader.checkProofOfWork(response.header))
         client.stop()
     }
 
     @Test
-    fun `header subscription`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.askCurrentHeader()
-
-        notifications.consumerCheck<HeaderSubscriptionResponse>()
-
+    fun `scripthash subscription`() = runTest { client ->
+        val response = client.startScriptHashSubscription(scriptHash)
+        assertNotEquals("", response.status)
         client.stop()
     }
 
     @Test
-    fun `scripthash subscription`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(ScriptHashSubscription(scriptHash))
-
-        notifications.consumerCheck<ScriptHashSubscriptionResponse> { message ->
-            assertNotEquals("", message.status)
-        }
-
+    fun `get scripthash history`() = runTest { client ->
+        val history = client.getScriptHashHistory(scriptHash)
+        assertTrue { history.contains(TransactionHistoryItem(500000, referenceTx.txid)) }
         client.stop()
     }
 
     @Test
-    fun `get scripthash history`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(GetScriptHashHistory(scriptHash))
-
-        notifications.consumerCheck<GetScriptHashHistoryResponse> { message ->
-            assertTrue { message.history.contains(TransactionHistoryItem(500000, referenceTx.txid)) }
-        }
-
+    fun `list script unspents`() = runTest { client ->
+        val response = client.getScriptHashUnspents(scriptHash)
+        assertTrue { response.isEmpty() }
         client.stop()
     }
 
     @Test
-    fun `list script unspents`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
-        val caller = client.Caller()
-        val notifications = caller.notifications.produceIn(this)
-
-        caller.sendElectrumRequest(ScriptHashListUnspent(scriptHash))
-
-        notifications.consumerCheck<ScriptHashListUnspentResponse> { message ->
-            assertTrue { message.unspents.isEmpty() }
-        }
-
-        client.stop()
-    }
-
-    @Test
-    fun `client multiplexing`() = runSuspendTest(timeout = 15.seconds) {
-        val client = connectToMainnetServer()
+    fun `client multiplexing`() = runTest { client ->
 
         val txids = listOf(
             ByteVector32("c1e943938e0bf2e9e6feefe22af0466514a58e9f7ed0f7ada6fd8e6dbeca0742"),
@@ -240,26 +159,22 @@ class ElectrumClientTest : LightningTestSuite() {
         )
 
         // request txids in parallel
-        val requests = txids.map {
-            val caller = client.Caller()
-            val notifications = caller.notifications.produceIn(this)
-            caller.sendElectrumRequest(GetTransaction(it))
-            it to notifications
-        }
-
-        // check that each client had the correct tx
-        requests.forEach { (txid, notifications) ->
-            notifications.consumerCheck<GetTransactionResponse> { res ->
-                assertEquals(txid, res.tx.txid)
+        val jobs = txids.map {
+            launch {
+                val tx = client.getTx(it)
+                assertEquals(it, tx.txid)
             }
         }
-
+        jobs.joinAll()
         client.stop()
     }
 
-    private suspend inline fun <reified T : ElectrumMessage> ReceiveChannel<ElectrumMessage>.consumerCheck(crossinline assertion: (T) -> Unit = {}) {
-        val msg = this@consumerCheck.consumeAsFlow().filterIsInstance<T>().firstOrNull()
-        assertNotNull(msg)
-        assertion(msg)
+    @Test
+    fun `get tx confirmations`() = runTest { client ->
+
+        assertTrue(client.getConfirmations(ByteVector32("f1c290880b6fc9355e4f1b1b7d13b9a15babbe096adaf13d01f3a56def793fd5"))!! > 0)
+        assertNull(client.getConfirmations(ByteVector32("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")))
+
+        client.stop()
     }
 }

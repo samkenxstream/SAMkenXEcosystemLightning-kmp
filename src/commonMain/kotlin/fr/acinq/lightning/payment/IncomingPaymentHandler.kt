@@ -6,10 +6,12 @@ import fr.acinq.bitcoin.Crypto
 import fr.acinq.bitcoin.PrivateKey
 import fr.acinq.lightning.CltvExpiry
 import fr.acinq.lightning.Lightning.randomBytes32
+import fr.acinq.lightning.LiquidityEvents
 import fr.acinq.lightning.MilliSatoshi
 import fr.acinq.lightning.NodeParams
-import fr.acinq.lightning.WalletParams
 import fr.acinq.lightning.channel.*
+import fr.acinq.lightning.channel.ChannelAction
+import fr.acinq.lightning.channel.ChannelCommand
 import fr.acinq.lightning.db.IncomingPayment
 import fr.acinq.lightning.db.IncomingPaymentsDb
 import fr.acinq.lightning.io.PayToOpenResponseCommand
@@ -38,7 +40,7 @@ data class PayToOpenPart(val payToOpenRequest: PayToOpenRequest, override val fi
     override val paymentHash: ByteVector32 = payToOpenRequest.paymentHash
 }
 
-class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: WalletParams, val db: IncomingPaymentsDb) {
+class IncomingPaymentHandler(val nodeParams: NodeParams, val db: IncomingPaymentsDb) {
 
     sealed class ProcessAddResult {
         abstract val actions: List<PeerCommand>
@@ -104,40 +106,48 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
     /**
      * Save the "received-with" details of an incoming amount.
      *
-     * - for a pay-to-open origin, we only save the id of the channel that was created for this payment.
-     * - for a swap-in origin, a new incoming payment must be created. We use the channel id to generate the payment's preimage.
-     * - for unknown origin, the amount is handled as a swap-in coming from an unknown address.
+     * - for a pay-to-open origin, the payment already exists and we only add a received-with.
+     * - for a swap-in origin, a new incoming payment must be created. We use a random.
      */
-    suspend fun process(channelId: ByteVector32, action: ChannelAction.Storage.StoreIncomingAmount) {
-        val fakePreimage = channelId.sha256()
-        when (action.origin) {
-            null -> {
-                // TODO: hacky, needs clean-up
-                logger.warning { "incoming amount with empty origin, we store only minimal information" }
-                db.addAndReceivePayment(
-                    preimage = fakePreimage,
-                    origin = IncomingPayment.Origin.SwapIn(address = ""),
-                    receivedWith = setOf(IncomingPayment.ReceivedWith.NewChannel(id = UUID.randomUUID(), amount = action.amount, serviceFee = 0.msat, channelId = channelId))
+    suspend fun process(channelId: ByteVector32, action: ChannelAction.Storage.StoreIncomingPayment) {
+        val receivedWith = when (action) {
+            is ChannelAction.Storage.StoreIncomingPayment.ViaNewChannel ->
+                IncomingPayment.ReceivedWith.NewChannel(
+                    amount = action.amount,
+                    serviceFee = action.serviceFee,
+                    miningFee = action.miningFee,
+                    channelId = channelId,
+                    txId = action.txId,
+                    confirmedAt = null,
+                    lockedAt = null,
                 )
-            }
-            is ChannelOrigin.PayToOpenOrigin -> {
-                // In that case, the pay-to-open payment parts have already been handled in the main `processPaymentPart` handler. We just need
-                // to update the channel id of the pay-to-open received-with parts with type new-channel.
-                db.updateNewChannelReceivedWithChannelId(action.origin.paymentHash, channelId)
-            }
-            is ChannelOrigin.PleaseOpenChannelOrigin -> {
-                db.addAndReceivePayment(
-                    preimage = fakePreimage,
-                    origin = IncomingPayment.Origin.DualSwapIn(action.localInputs),
-                    receivedWith = setOf(
-                        IncomingPayment.ReceivedWith.NewChannel(
-                            id = UUID.randomUUID(),
-                            amount = action.amount,
-                            serviceFee = action.origin.serviceFee,
-                            fundingFee = action.origin.fundingFee,
-                            channelId = channelId
-                        )
-                    )
+            is ChannelAction.Storage.StoreIncomingPayment.ViaSpliceIn ->
+                IncomingPayment.ReceivedWith.SpliceIn(
+                    amount = action.amount,
+                    serviceFee = action.serviceFee,
+                    miningFee = action.miningFee,
+                    channelId = channelId,
+                    txId = action.txId,
+                    confirmedAt = null,
+                    lockedAt = null,
+                )
+        }
+        when (val origin = action.origin) {
+            is Origin.PayToOpenOrigin ->
+                // there already is a corresponding Lightning invoice in the db
+                db.receivePayment(
+                    paymentHash = origin.paymentHash,
+                    receivedWith = listOf(receivedWith)
+                )
+            else -> {
+                // this is a swap, there was no pre-existing invoice, we need to create a fake one
+                val incomingPayment = db.addIncomingPayment(
+                    preimage = randomBytes32(), // not used, placeholder
+                    origin = IncomingPayment.Origin.OnChain(action.txId, action.localInputs)
+                )
+                db.receivePayment(
+                    paymentHash = incomingPayment.paymentHash,
+                    receivedWith = listOf(receivedWith)
                 )
             }
         }
@@ -177,7 +187,7 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
     /** Main payment processing, that handles payment parts. */
     private suspend fun processPaymentPart(paymentPart: PaymentPart, currentBlockHeight: Int): ProcessAddResult {
         val logger = MDCLogger(logger.logger, staticMdc = paymentPart.mdc())
-        when(paymentPart) {
+        when (paymentPart) {
             is HtlcPart -> logger.info { "processing htlc part expiry=${paymentPart.htlc.cltvExpiry}" }
             is PayToOpenPart -> logger.info { "processing pay-to-open part amount=${paymentPart.payToOpenRequest.amountMsat} funding=${paymentPart.payToOpenRequest.fundingSatoshis} fees=${paymentPart.payToOpenRequest.payToOpenFeeSatoshis}" }
         }
@@ -200,7 +210,7 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
                             val htlcsMapInDb = incomingPayment.received.receivedWith.filterIsInstance<IncomingPayment.ReceivedWith.LightningPayment>().map { it.channelId to it.htlcId }
                             if (htlcsMapInDb.contains(paymentPart.htlc.channelId to paymentPart.htlc.id)) {
                                 logger.info { "accepting local replay of htlc=${paymentPart.htlc.id} on channel=${paymentPart.htlc.channelId}" }
-                                val action = WrappedChannelCommand(paymentPart.htlc.channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(paymentPart.htlc.id, incomingPayment.preimage, true)))
+                                val action = WrappedChannelCommand(paymentPart.htlc.channelId, ChannelCommand.Htlc.Settlement.Fulfill(paymentPart.htlc.id, incomingPayment.preimage, true))
                                 ProcessAddResult.Accepted(listOf(action), incomingPayment, incomingPayment.received)
                             } else {
                                 logger.info { "rejecting htlc part for an invoice that has already been paid" }
@@ -216,8 +226,6 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
                     }
                 } else {
                     val payment = pending[paymentPart.paymentHash]?.add(paymentPart) ?: PendingPayment(paymentPart)
-                    val payToOpenMinAmount = payment.parts.filterIsInstance<PayToOpenPart>().map { it.payToOpenRequest.payToOpenMinAmountMsat }.firstOrNull()
-                    val payToOpenAmount = payment.parts.filterIsInstance<PayToOpenPart>().map { it.payToOpenRequest.amountMsat }.sum()
                     when {
                         paymentPart.totalAmount != payment.totalAmount -> {
                             // Bolt 04:
@@ -238,68 +246,57 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
                             pending[paymentPart.paymentHash] = payment
                             return ProcessAddResult.Pending(incomingPayment)
                         }
-                        payToOpenMinAmount != null && payToOpenAmount < payToOpenMinAmount -> {
-                            // Because of the cost of opening a new channel, there is a minimum amount for incoming payments to trigger
-                            // a pay-to-open. Given that the total amount of a payment is included in each payment part, we could have
-                            // rejected pay-to-open parts as they arrived, but it would have caused two issues:
-                            // - in case there is a mix of htlc parts and pay-to-open parts, the htlc parts would have been accepted and we
-                            // would have waited for a timeout before failing them (since the payment would never complete)
-                            // - if we rejected each pay-to-open part individually, we wouldn't have been able to emit a single event
-                            //   regarding the failed pay-to-open
-                            // That is why, instead, we wait for all parts to arrive. Then, if there is at least one pay-to-open part, and if
-                            // the total received amount is less than the minimum amount required for a pay-to-open, we fail the payment.
-                            logger.warning { "amount too low for a pay-to-open: $payToOpenAmount, min is $payToOpenMinAmount" }
-                            val actions = payment.parts.map { part ->
-                                val failureMsg = IncorrectOrUnknownPaymentDetails(part.totalAmount, currentBlockHeight.toLong())
-                                when (part) {
-                                    is HtlcPart -> actionForFailureMessage(failureMsg, part.htlc)
-                                    is PayToOpenPart -> actionForPayToOpenFailure(privateKey, failureMsg, part.payToOpenRequest) // NB: this will fail all parts, we could only return one
+                        else -> {
+                            if (payment.parts.filterIsInstance<PayToOpenPart>().isNotEmpty()) {
+                                // We consider the total amount received (not only the pay-to-open parts) to evaluate whether or not to accept the payment
+                                val payToOpenFee = payment.parts.filterIsInstance<PayToOpenPart>().map { it.payToOpenRequest.payToOpenFeeSatoshis }.sum()
+                                nodeParams.liquidityPolicy.value.maybeReject(payment.amountReceived, payToOpenFee.toMilliSatoshi(), LiquidityEvents.Source.OffChainPayment, logger)?.let { rejected ->
+                                    logger.info { "rejecting pay-to-open: reason=${rejected.reason}" }
+                                    nodeParams._nodeEvents.emit(rejected)
+                                    val actions = payment.parts.map { part ->
+                                        val failureMsg = TemporaryNodeFailure
+                                        when (part) {
+                                            is HtlcPart -> actionForFailureMessage(failureMsg, part.htlc)
+                                            is PayToOpenPart -> actionForPayToOpenFailure(privateKey, failureMsg, part.payToOpenRequest) // NB: this will fail all parts, we could only return one
+                                        }
+                                    }
+                                    pending.remove(paymentPart.paymentHash)
+                                    return ProcessAddResult.Rejected(actions, incomingPayment)
                                 }
                             }
-                            pending.remove(paymentPart.paymentHash)
-                            return ProcessAddResult.Rejected(actions, incomingPayment)
-                        }
-                        else -> {
-                            // We have received all the payment parts.
+
                             when (val paymentMetadata = paymentPart.finalPayload.paymentMetadata) {
                                 null -> logger.info { "payment received (${payment.amountReceived}) without payment metadata" }
                                 else -> logger.info { "payment received (${payment.amountReceived}) with payment metadata ($paymentMetadata)" }
                             }
-                            val (actions, receivedWith) = payment.parts.map { part ->
-                                when (part) {
-                                    is HtlcPart -> {
-                                        val cmd = CMD_FULFILL_HTLC(part.htlc.id, incomingPayment.preimage, true)
-                                        val channelCommand = ChannelCommand.ExecuteCommand(cmd)
-                                        WrappedChannelCommand(
-                                            channelId = part.htlc.channelId,
-                                            channelCommand = channelCommand
-                                        ) to IncomingPayment.ReceivedWith.LightningPayment(
-                                            amount = part.amount,
-                                            htlcId = part.htlc.id,
-                                            channelId = part.htlc.channelId
-                                        )
-                                    }
-                                    is PayToOpenPart -> PayToOpenResponseCommand(
-                                        PayToOpenResponse(
-                                            chainHash = part.payToOpenRequest.chainHash,
-                                            paymentHash = paymentPart.paymentHash,
-                                            result = PayToOpenResponse.Result.Success(incomingPayment.preimage)
-                                        )
-                                    ) to IncomingPayment.ReceivedWith.NewChannel(
-                                        // The part's amount is the full amount, including the fee. The fee must be subtracted.
-                                        id = UUID.randomUUID(),
-                                        amount = part.amount - part.payToOpenRequest.payToOpenFeeSatoshis.toMilliSatoshi(),
-                                        serviceFee = part.payToOpenRequest.payToOpenFeeSatoshis.toMilliSatoshi(),
-                                        // At that point we do not know the channel's id. It will be set later on.
-                                        channelId = null
-                                    )
+                            val htlcParts = payment.parts.filterIsInstance<HtlcPart>()
+                            val payToOpenParts = payment.parts.filterIsInstance<PayToOpenPart>()
+                            // We only fill the DB with htlc parts, because we cannot be sure yet that our peer will honor the pay-to-open part(s).
+                            // When the payment contains pay-to-open parts, it will be considered received, but the sum of all parts will be smaller
+                            // than the expected amount. The pay-to-open part(s) will be added once we received the corresponding new channel or a splice-in.
+                            val receivedWith = htlcParts.map { part ->
+                                IncomingPayment.ReceivedWith.LightningPayment(
+                                    amount = part.amount,
+                                    htlcId = part.htlc.id,
+                                    channelId = part.htlc.channelId
+                                )
+                            }
+                            val actions = buildList {
+                                htlcParts.forEach { part ->
+                                    val cmd = ChannelCommand.Htlc.Settlement.Fulfill(part.htlc.id, incomingPayment.preimage, true)
+                                    add(WrappedChannelCommand(part.htlc.channelId, cmd))
                                 }
-                            }.unzip()
+                                // We avoid sending duplicate pay-to-open responses, since the preimage is the same for every part.
+                                if (payToOpenParts.isNotEmpty()) {
+                                    val response = PayToOpenResponse(nodeParams.chainHash, incomingPayment.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage))
+                                    add(PayToOpenResponseCommand(response))
+                                }
+                            }
+
                             pending.remove(paymentPart.paymentHash)
-
-                            val received = IncomingPayment.Received(receivedWith = receivedWith.toSet())
-
+                            val received = IncomingPayment.Received(receivedWith = receivedWith)
                             db.receivePayment(paymentPart.paymentHash, received.receivedWith)
+
                             return ProcessAddResult.Accepted(actions, incomingPayment.copy(received = received), received)
                         }
                     }
@@ -362,10 +359,6 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
                 logger.warning { "payment with expiry too small: ${paymentPart.htlc.cltvExpiry}, min is ${minFinalCltvExpiry(incomingPayment.origin.paymentRequest, currentBlockHeight)}" }
                 Either.Left(rejectPaymentPart(privateKey, paymentPart, incomingPayment, currentBlockHeight))
             }
-            paymentPart is PayToOpenPart && paymentPart.payToOpenRequest.fundingSatoshis < nodeParams.minFundingSatoshis -> {
-                logger.warning { "received invalid funding amount for a pay-to-open: ${paymentPart.payToOpenRequest.fundingSatoshis}, min is ${nodeParams.minFundingSatoshis}" }
-                Either.Left(rejectPaymentPart(privateKey, paymentPart, incomingPayment, currentBlockHeight))
-            }
             else -> Either.Right(incomingPayment)
         }
     }
@@ -408,6 +401,17 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
         }
     }
 
+    /**
+     * If we are disconnected, the LSP will forget pending pay-to-open requests. We need to do the same otherwise we
+     * will accept outdated ones.
+     */
+    fun purgePayToOpenRequests() {
+        val valuesToReplace = pending.mapValues { entry -> entry.value.copy(parts = entry.value.parts.filter { it !is PayToOpenPart }.toSet()) }
+        pending.plusAssign(valuesToReplace)
+        val keysToRemove = pending.filterValues { it.parts.isEmpty() }.keys
+        pending.minusAssign(keysToRemove)
+    }
+
     companion object {
         /** Convert an incoming htlc to a payment part abstraction. Payment parts are then summed together to reach the full payment amount. */
         private fun toPaymentPart(privateKey: PrivateKey, htlc: UpdateAddHtlc): Either<ProcessAddResult.Rejected, HtlcPart> {
@@ -447,16 +451,15 @@ class IncomingPaymentHandler(val nodeParams: NodeParams, val walletParams: Walle
         }
 
         private fun actionForFailureMessage(msg: FailureMessage, htlc: UpdateAddHtlc, commit: Boolean = true): WrappedChannelCommand {
-            val cmd: Command = when (msg) {
-                is BadOnion -> CMD_FAIL_MALFORMED_HTLC(htlc.id, msg.onionHash, msg.code, commit)
-                else -> CMD_FAIL_HTLC(htlc.id, CMD_FAIL_HTLC.Reason.Failure(msg), commit)
+            val cmd: ChannelCommand.Htlc.Settlement = when (msg) {
+                is BadOnion -> ChannelCommand.Htlc.Settlement.FailMalformed(htlc.id, msg.onionHash, msg.code, commit)
+                else -> ChannelCommand.Htlc.Settlement.Fail(htlc.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(msg), commit)
             }
-            val channelCommand = ChannelCommand.ExecuteCommand(cmd)
-            return WrappedChannelCommand(htlc.channelId, channelCommand)
+            return WrappedChannelCommand(htlc.channelId, cmd)
         }
 
-        private fun actionForPayToOpenFailure(privateKey: PrivateKey, failure: FailureMessage, payToOpenRequest: PayToOpenRequest): PayToOpenResponseCommand {
-            val reason = CMD_FAIL_HTLC.Reason.Failure(failure)
+        fun actionForPayToOpenFailure(privateKey: PrivateKey, failure: FailureMessage, payToOpenRequest: PayToOpenRequest): PayToOpenResponseCommand {
+            val reason = ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(failure)
             val encryptedReason = when (val result = OutgoingPaymentPacket.buildHtlcFailure(privateKey, payToOpenRequest.paymentHash, payToOpenRequest.finalPacket, reason)) {
                 is Either.Right -> result.value
                 is Either.Left -> null

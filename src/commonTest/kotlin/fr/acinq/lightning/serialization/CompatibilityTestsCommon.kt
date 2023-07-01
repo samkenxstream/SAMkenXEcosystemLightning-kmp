@@ -7,6 +7,10 @@ import fr.acinq.lightning.Lightning
 import fr.acinq.lightning.blockchain.BITCOIN_FUNDING_DEPTHOK
 import fr.acinq.lightning.blockchain.WatchEventConfirmed
 import fr.acinq.lightning.channel.*
+import fr.acinq.lightning.channel.ChannelCommand
+import fr.acinq.lightning.channel.states.Normal
+import fr.acinq.lightning.channel.states.WaitForChannelReady
+import fr.acinq.lightning.channel.states.WaitForFundingConfirmed
 import fr.acinq.lightning.channel.states.WaitForFundingConfirmedTestsCommon
 import fr.acinq.lightning.serialization.Encryption.from
 import fr.acinq.lightning.tests.TestConstants
@@ -18,17 +22,10 @@ import fr.acinq.lightning.wire.UpdateAddHtlc
 import kotlin.test.*
 
 class CompatibilityTestsCommon {
-    @Ignore
-    @Test
+    //@Test
     fun `generate data`() {
         // generate test data
-        val (alice, bob, fundingTx) = run {
-            val (alice0, bob0, txSigsBob) = WaitForFundingConfirmedTestsCommon.init(ChannelType.SupportedChannelType.AnchorOutputs)
-            val (alice1, actions1) = alice0.process(ChannelCommand.MessageReceived(txSigsBob))
-            assertIs<LNChannel<WaitForFundingConfirmed>>(alice1)
-            val fundingTx = actions1.find<ChannelAction.Blockchain.PublishTx>().tx
-            Triple(alice1, bob0, fundingTx)
-        }
+        val (alice, bob, fundingTx) = WaitForFundingConfirmedTestsCommon.init(ChannelType.SupportedChannelType.AnchorOutputs)
         println("funding_tx: ${Transaction.write(fundingTx).byteVector().toHex()}")
         val bin = EncryptedChannelData.from(TestConstants.Bob.nodeParams.nodePrivateKey, bob.state)
         println("wait_for_funding_confirmed: ${bin.data}")
@@ -53,29 +50,29 @@ class CompatibilityTestsCommon {
         val bin2 = EncryptedChannelData.from(TestConstants.Bob.nodeParams.nodePrivateKey, bob2.state)
         println("normal: ${bin2.data}")
 
-        val add1 = CMD_ADD_HTLC(
+        val add1 = ChannelCommand.Htlc.Add(
             10_000.msat,
             Lightning.randomBytes32(),
             CltvExpiryDelta(144).toCltvExpiry(TestConstants.defaultBlockHeight.toLong()),
             TestConstants.emptyOnionPacket,
             UUID.randomUUID()
         )
-        val add2 = CMD_ADD_HTLC(
+        val add2 = ChannelCommand.Htlc.Add(
             10_000.msat,
             Lightning.randomBytes32(),
             CltvExpiryDelta(144).toCltvExpiry(TestConstants.defaultBlockHeight.toLong()),
             TestConstants.emptyOnionPacket,
             UUID.randomUUID()
         )
-        val (alice3, actionsAlice3) = alice2.process(ChannelCommand.ExecuteCommand(add1))
-        val (_, actionsAlice4) = alice3.process(ChannelCommand.ExecuteCommand(add2))
+        val (alice3, actionsAlice3) = alice2.process(add1)
+        val (_, actionsAlice4) = alice3.process(add2)
         val htlc1 = actionsAlice3.findOutgoingMessage<UpdateAddHtlc>()
         val htlc2 = actionsAlice4.findOutgoingMessage<UpdateAddHtlc>()
 
         val (bob3, _) = bob2.process(ChannelCommand.MessageReceived(htlc1))
         val (bob4, _) = bob3.process(ChannelCommand.MessageReceived(htlc2))
-        val (bob5, _) = bob4.process(ChannelCommand.ExecuteCommand(add1))
-        val (bob6, _) = bob5.process(ChannelCommand.ExecuteCommand(add2))
+        val (bob5, _) = bob4.process(add1)
+        val (bob6, _) = bob5.process(add2)
 
         assertIs<LNChannel<Normal>>(bob6)
 

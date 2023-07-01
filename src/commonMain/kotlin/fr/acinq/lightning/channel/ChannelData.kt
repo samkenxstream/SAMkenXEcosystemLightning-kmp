@@ -4,6 +4,7 @@ import fr.acinq.bitcoin.*
 import fr.acinq.lightning.CltvExpiryDelta
 import fr.acinq.lightning.Features
 import fr.acinq.lightning.MilliSatoshi
+import fr.acinq.lightning.NodeParams
 import fr.acinq.lightning.channel.Helpers.publishIfNeeded
 import fr.acinq.lightning.channel.Helpers.watchConfirmedIfNeeded
 import fr.acinq.lightning.channel.Helpers.watchSpentIfNeeded
@@ -103,10 +104,10 @@ data class LocalCommitPublished(
 
     internal fun LoggingContext.doPublish(channelId: ByteVector32, minDepth: Long): List<ChannelAction> {
         val publishQueue = buildList {
-            add(commitTx)
-            claimMainDelayedOutputTx?.let { add(it.tx) }
-            addAll(htlcTxs.values.mapNotNull { it?.tx })
-            addAll(claimHtlcDelayedTxs.map { it.tx })
+            add(ChannelAction.Blockchain.PublishTx(commitTx, ChannelAction.Blockchain.PublishTx.Type.CommitTx))
+            claimMainDelayedOutputTx?.let { add(ChannelAction.Blockchain.PublishTx(it)) }
+            addAll(htlcTxs.values.filterNotNull().map { ChannelAction.Blockchain.PublishTx(it) })
+            addAll(claimHtlcDelayedTxs.map { ChannelAction.Blockchain.PublishTx(it) })
         }
         val publishList = publishIfNeeded(publishQueue, irrevocablySpent)
 
@@ -210,8 +211,8 @@ data class RemoteCommitPublished(
 
     internal fun LoggingContext.doPublish(channelId: ByteVector32, minDepth: Long): List<ChannelAction> {
         val publishQueue = buildList {
-            claimMainOutputTx?.let { add(it.tx) }
-            addAll(claimHtlcTxs.values.mapNotNull { it?.tx })
+            claimMainOutputTx?.let { add(ChannelAction.Blockchain.PublishTx(it)) }
+            addAll(claimHtlcTxs.values.filterNotNull().map { ChannelAction.Blockchain.PublishTx(it) })
         }
         val publishList = publishIfNeeded(publishQueue, irrevocablySpent)
 
@@ -310,10 +311,10 @@ data class RevokedCommitPublished(
 
     internal fun LoggingContext.doPublish(channelId: ByteVector32, minDepth: Long): List<ChannelAction> {
         val publishQueue = buildList {
-            claimMainOutputTx?.let { add(it.tx) }
-            mainPenaltyTx?.let { add(it.tx) }
-            addAll(htlcPenaltyTxs.map { it.tx })
-            addAll(claimHtlcDelayedPenaltyTxs.map { it.tx })
+            claimMainOutputTx?.let { add(ChannelAction.Blockchain.PublishTx(it)) }
+            mainPenaltyTx?.let { add(ChannelAction.Blockchain.PublishTx(it)) }
+            addAll(htlcPenaltyTxs.map { ChannelAction.Blockchain.PublishTx(it) })
+            addAll(claimHtlcDelayedPenaltyTxs.map { ChannelAction.Blockchain.PublishTx(it) })
         }
         val publishList = publishIfNeeded(publishQueue, irrevocablySpent)
 
@@ -341,45 +342,6 @@ data class RevokedCommitPublished(
     }
 }
 
-/**
- * Channel keys recovered from the channel's funding public key (note that we obviously cannot recover the funding private key)
- * These keys can be used to spend our outputs from a commit tx that has been published to the blockchain, without any other information than
- * the node's seed ("backup less backup")
- */
-data class RecoveredChannelKeys(
-    val fundingPubKey: PublicKey,
-    val paymentKey: PrivateKey,
-    val delayedPaymentKey: PrivateKey,
-    val htlcKey: PrivateKey,
-    val revocationKey: PrivateKey,
-    val shaSeed: ByteVector32
-) {
-    val htlcBasepoint: PublicKey = htlcKey.publicKey()
-    val paymentBasepoint: PublicKey = paymentKey.publicKey()
-    val delayedPaymentBasepoint: PublicKey = delayedPaymentKey.publicKey()
-    val revocationBasepoint: PublicKey = revocationKey.publicKey()
-}
-
-/**
- * Channel secrets and keys, generated from a funding key BIP32 path
- */
-data class ChannelKeys(
-    val fundingKeyPath: KeyPath,
-    val fundingPrivateKey: PrivateKey,
-    val paymentKey: PrivateKey,
-    val delayedPaymentKey: PrivateKey,
-    val htlcKey: PrivateKey,
-    val revocationKey: PrivateKey,
-    val shaSeed: ByteVector32
-) {
-    val fundingPubKey: PublicKey = fundingPrivateKey.publicKey()
-    val htlcBasepoint: PublicKey = htlcKey.publicKey()
-    val paymentBasepoint: PublicKey = paymentKey.publicKey()
-    val delayedPaymentBasepoint: PublicKey = delayedPaymentKey.publicKey()
-    val revocationBasepoint: PublicKey = revocationKey.publicKey()
-    val temporaryChannelId: ByteVector32 = (ByteVector(ByteArray(33) { 0 }) + revocationBasepoint.value).sha256()
-}
-
 data class LocalParams(
     val nodeId: PublicKey,
     val fundingKeyPath: KeyPath,
@@ -392,6 +354,19 @@ data class LocalParams(
     val defaultFinalScriptPubKey: ByteVector,
     val features: Features
 ) {
+    constructor(nodeParams: NodeParams, isInitiator: Boolean): this(
+        nodeId = nodeParams.nodeId,
+        fundingKeyPath = nodeParams.keyManager.newFundingKeyPath(isInitiator), // we make sure that initiator and non-initiator key path end differently
+        dustLimit = nodeParams.dustLimit,
+        maxHtlcValueInFlightMsat = nodeParams.maxHtlcValueInFlightMsat,
+        htlcMinimum = nodeParams.htlcMinimum,
+        toSelfDelay = nodeParams.toRemoteDelayBlocks, // we choose their delay
+        maxAcceptedHtlcs = nodeParams.maxAcceptedHtlcs,
+        isInitiator = isInitiator,
+        defaultFinalScriptPubKey = nodeParams.keyManager.finalOnChainWallet.pubkeyScript(addressIndex = 0), // the default closing address is the same for all channels
+        features = nodeParams.features.initFeatures()
+    )
+
     fun channelKeys(keyManager: KeyManager) = keyManager.channelKeys(fundingKeyPath)
 }
 
@@ -402,7 +377,6 @@ data class RemoteParams(
     val htlcMinimum: MilliSatoshi,
     val toSelfDelay: CltvExpiryDelta,
     val maxAcceptedHtlcs: Int,
-    val fundingPubKey: PublicKey,
     val revocationBasepoint: PublicKey,
     val paymentBasepoint: PublicKey,
     val delayedPaymentBasepoint: PublicKey,
@@ -417,8 +391,13 @@ object ChannelFlags {
 
 data class ClosingTxProposed(val unsignedTx: ClosingTx, val localClosingSigned: ClosingSigned)
 
-/** This gives the reason for creating a new channel. */
-sealed class ChannelOrigin {
-    data class PayToOpenOrigin(val paymentHash: ByteVector32, val fee: Satoshi) : ChannelOrigin()
-    data class PleaseOpenChannelOrigin(val requestId: ByteVector32, val serviceFee: MilliSatoshi, val fundingFee: Satoshi) : ChannelOrigin()
+/** Reason for creating a new channel or a splice. */
+// @formatter:off
+sealed class Origin {
+    abstract val amount: MilliSatoshi
+    abstract val serviceFee: MilliSatoshi
+    abstract val miningFee: Satoshi
+    data class PayToOpenOrigin(val paymentHash: ByteVector32, override val serviceFee: MilliSatoshi, override val miningFee: Satoshi, override val amount: MilliSatoshi) : Origin()
+    data class PleaseOpenChannelOrigin(val requestId: ByteVector32, override val serviceFee: MilliSatoshi, override val miningFee: Satoshi, override val amount: MilliSatoshi) : Origin()
 }
+// @formatter:on

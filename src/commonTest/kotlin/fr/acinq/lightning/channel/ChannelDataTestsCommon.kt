@@ -12,8 +12,8 @@ import fr.acinq.lightning.channel.TestsHelper.claimHtlcTimeoutTxs
 import fr.acinq.lightning.channel.TestsHelper.crossSign
 import fr.acinq.lightning.channel.TestsHelper.htlcSuccessTxs
 import fr.acinq.lightning.channel.TestsHelper.htlcTimeoutTxs
-
 import fr.acinq.lightning.channel.TestsHelper.reachNormal
+import fr.acinq.lightning.channel.states.Closing
 import fr.acinq.lightning.tests.utils.LightningTestSuite
 import fr.acinq.lightning.transactions.Transactions.InputInfo
 import fr.acinq.lightning.transactions.Transactions.TransactionWithInputInfo.*
@@ -25,7 +25,6 @@ import fr.acinq.lightning.utils.LoggingContext
 import fr.acinq.lightning.utils.MDCLogger
 import fr.acinq.lightning.utils.msat
 import fr.acinq.lightning.utils.sat
-import org.kodein.log.Logger
 import org.kodein.log.LoggerFactory
 import org.kodein.log.newLogger
 import kotlin.test.*
@@ -48,7 +47,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             // We use watch-spent on the outputs both parties can claim (htlc outputs).
             val watchSpent = actions.findWatches<WatchSpent>().map { OutPoint(it.txId, it.outputIndex.toLong()) }.toSet()
             assertEquals(watchSpent, listOf(2L, 3L, 4L, 5L).map { OutPoint(lcp.commitTx.txid, it) }.toSet())
-            val txs = actions.findTxs().toSet()
+            val txs = actions.findPublishTxs().toSet()
             assertEquals(txs, setOf(lcp.commitTx, lcp.claimMainDelayedOutputTx!!.tx) + lcp.htlcTxs.values.filterNotNull().map { it.tx } + lcp.claimHtlcDelayedTxs.map { it.tx }.toSet())
         }
 
@@ -76,7 +75,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             // We still watch the remaining unclaimed htlc outputs.
             val watchSpent = actions.findWatches<WatchSpent>().map { OutPoint(it.txId, it.outputIndex.toLong()) }.toSet()
             assertEquals(watchSpent, listOf(4L, 5L).map { OutPoint(lcp.commitTx.txid, it) }.toSet())
-            val txs = actions.findTxs()
+            val txs = actions.findPublishTxs()
             assertEquals(txs, lcp.htlcTimeoutTxs().map { it.tx } + lcp.claimHtlcDelayedTxs.drop(2).map { it.tx })
         }
 
@@ -119,7 +118,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             // We use watch-spent on the outputs both parties can claim (htlc outputs).
             val watchSpent = actions.findWatches<WatchSpent>().map { OutPoint(it.txId, it.outputIndex.toLong()) }.toSet()
             assertEquals(watchSpent, listOf(2L, 3L, 4L, 5L).map { OutPoint(rcp.commitTx.txid, it) }.toSet())
-            val txs = actions.findTxs().toSet()
+            val txs = actions.findPublishTxs().toSet()
             assertEquals(txs, setOf(rcp.claimMainOutputTx!!.tx) + rcp.claimHtlcTxs.values.filterNotNull().map { it.tx }.toSet())
         }
 
@@ -146,7 +145,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             // We still watch the remaining unclaimed htlc outputs.
             val watchSpent = actions.findWatches<WatchSpent>().map { OutPoint(it.txId, it.outputIndex.toLong()) }.toSet()
             assertEquals(watchSpent, listOf(3L, 5L).map { OutPoint(rcp.commitTx.txid, it) }.toSet())
-            val txs = actions.findTxs().toSet()
+            val txs = actions.findPublishTxs().toSet()
             assertEquals(txs, setOf(rcp.claimHtlcSuccessTxs().last().tx, rcp.claimHtlcTimeoutTxs().last().tx))
         }
 
@@ -188,7 +187,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             // We use watch-spent on the outputs both parties can claim (htlc outputs and the remote main output).
             val watchSpent = actions.findWatches<WatchSpent>().map { OutPoint(it.txId, it.outputIndex.toLong()) }.toSet()
             assertEquals(watchSpent, listOf(1L, 2L, 3L, 4L, 5L).map { OutPoint(rvk.commitTx.txid, it) }.toSet())
-            val txs = actions.findTxs().toSet()
+            val txs = actions.findPublishTxs().toSet()
             assertEquals(txs, setOf(rvk.claimMainOutputTx!!.tx, rvk.mainPenaltyTx!!.tx) + rvk.htlcPenaltyTxs.map { it.tx }.toSet())
         }
 
@@ -212,7 +211,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             // We still watch the remaining unclaimed outputs (htlc and remote main output).
             val watchSpent = actions.findWatches<WatchSpent>().map { OutPoint(it.txId, it.outputIndex.toLong()) }.toSet()
             assertEquals(watchSpent, listOf(1L, 4L, 5L).map { OutPoint(rvk.commitTx.txid, it) }.toSet())
-            val txs = actions.findTxs().toSet()
+            val txs = actions.findPublishTxs().toSet()
             assertEquals(txs, setOf(rvk.mainPenaltyTx!!.tx, rvk.htlcPenaltyTxs[2].tx, rvk.htlcPenaltyTxs[3].tx))
         }
 
@@ -246,7 +245,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             assertTrue(actions.findWatches<WatchConfirmed>().isEmpty())
             // NB: the channel, after calling Helpers.claimRevokedHtlcTxOutputs, will put a watch-spent on the htlc-txs.
             assertTrue(actions.findWatches<WatchSpent>().isEmpty())
-            assertEquals(actions.findTxs().toSet(), rvk4b.claimHtlcDelayedPenaltyTxs.map { it.tx }.toSet())
+            assertEquals(actions.findPublishTxs().toSet(), rvk4b.claimHtlcDelayedPenaltyTxs.map { it.tx }.toSet())
 
             // We claim one of the remaining outputs, they claim the other.
             val rvk5a = rvk4b.update(rvk4b.claimHtlcDelayedPenaltyTxs[0].tx)
@@ -272,10 +271,10 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             val (bob5, alice5) = nodes5
             val (bob6, alice6) = crossSign(bob5, alice5)
             // Alice and Bob both know the preimage for only one of the two HTLCs they received.
-            val (alice7, _) = alice6.process(ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlcBob.id, preimageBob)))
-            val (bob7, _) = bob6.process(ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlcAlice.id, preimageAlice)))
+            val (alice7, _) = alice6.process(ChannelCommand.Htlc.Settlement.Fulfill(htlcBob.id, preimageBob))
+            val (bob7, _) = bob6.process(ChannelCommand.Htlc.Settlement.Fulfill(htlcAlice.id, preimageAlice))
             // Alice publishes her commitment.
-            val (aliceClosing, _) = alice7.process(ChannelCommand.ExecuteCommand(CMD_FORCECLOSE))
+            val (aliceClosing, _) = alice7.process(ChannelCommand.Close.ForceClose)
             assertIs<LNChannel<Closing>>(aliceClosing)
             val lcp = aliceClosing.state.localCommitPublished
             assertNotNull(lcp)
@@ -362,7 +361,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
             }
 
             val remoteCommit = run {
-                val claimMain = ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx(txInput(claimMainAlice), claimMainAlice)
+                val claimMain = ClaimRemoteCommitMainOutputTx.ClaimRemoteDelayedOutputTx(txInput(claimMainAlice), claimMainAlice)
                 val claimHtlcTxs = mapOf(
                     htlcSuccess1.txIn.first().outPoint to ClaimHtlcSuccessTx(txInput(htlcSuccess1), htlcSuccess1, 0),
                     htlcSuccess2.txIn.first().outPoint to ClaimHtlcSuccessTx(txInput(htlcSuccess2), htlcSuccess2, 1),
@@ -377,7 +376,7 @@ class ChannelDataTestsCommon : LightningTestSuite(), LoggingContext {
                     val tx = Transaction(2, listOf(TxIn(OutPoint(commitTx, 1), 0)), listOf(TxOut(39_500.sat, ByteVector.empty)), 0)
                     MainPenaltyTx(txInput(tx), tx)
                 }
-                val claimMain = ClaimRemoteCommitMainOutputTx.ClaimP2WPKHOutputTx(txInput(claimMainAlice), claimMainAlice)
+                val claimMain = ClaimRemoteCommitMainOutputTx.ClaimRemoteDelayedOutputTx(txInput(claimMainAlice), claimMainAlice)
                 val htlcPenaltyTxs = listOf(htlcSuccess1, htlcSuccess2, htlcTimeout1, htlcTimeout2).map { HtlcPenaltyTx(txInput(it), it) }
                 RevokedCommitPublished(commitTx, randomKey(), claimMain, mainPenalty, htlcPenaltyTxs)
             }

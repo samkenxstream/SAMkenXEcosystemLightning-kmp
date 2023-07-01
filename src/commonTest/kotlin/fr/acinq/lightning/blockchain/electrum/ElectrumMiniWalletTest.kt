@@ -20,7 +20,7 @@ class ElectrumMiniWalletTest : LightningTestSuite() {
     @Test
     fun `single address with no utxos`() = runSuspendTest(timeout = 15.seconds) {
         val client = connectToMainnetServer()
-        val wallet = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client.Caller(), this, LoggerFactory.default)
+        val wallet = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client, this, LoggerFactory.default)
         wallet.addAddress("bc1qyjmhaptq78vh5j7tnzu7ujayd8sftjahphxppz")
 
         val walletState = wallet.walletStateFlow
@@ -30,29 +30,48 @@ class ElectrumMiniWalletTest : LightningTestSuite() {
         assertEquals(0, walletState.utxos.size)
         assertEquals(0.sat, walletState.totalBalance)
 
+        wallet.stop()
         client.stop()
     }
 
     @Test
     fun `single address with existing utxos`() = runSuspendTest(timeout = 15.seconds) {
         val client = connectToMainnetServer()
-        val wallet = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client.Caller(), this, LoggerFactory.default)
+        val wallet = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client, this, LoggerFactory.default)
         wallet.addAddress("14xb2HATmkBzrHf4CR2hZczEtjYpTh92d2")
 
         val walletState = wallet.walletStateFlow
             .filter { it.addresses.size == 1 && it.consistent }
             .first()
 
+        // This address has 3 transactions confirmed at block 100 002 and 3 transactions confirmed at block 100 003.
         assertEquals(6, walletState.utxos.size)
         assertEquals(30_000_000.sat, walletState.totalBalance)
 
+        run {
+            val withConf = walletState.withConfirmations(currentBlockHeight = 100_004, minConfirmations = 3)
+            assertEquals(0, withConf.unconfirmed.size)
+            assertEquals(3, withConf.weaklyConfirmed.size)
+            assertEquals(3, withConf.deeplyConfirmed.size)
+            assertEquals(15_000_000.sat, withConf.weaklyConfirmed.balance)
+            assertEquals(15_000_000.sat, withConf.deeplyConfirmed.balance)
+        }
+        run {
+            val withConf = walletState.withConfirmations(currentBlockHeight = 100_005, minConfirmations = 3)
+            assertEquals(0, withConf.unconfirmed.size)
+            assertEquals(0, withConf.weaklyConfirmed.size)
+            assertEquals(6, withConf.deeplyConfirmed.size)
+            assertEquals(30_000_000.sat, withConf.deeplyConfirmed.balance)
+        }
+
+        wallet.stop()
         client.stop()
     }
 
     @Test
     fun `multiple addresses`() = runSuspendTest(timeout = 15.seconds) {
         val client = connectToMainnetServer()
-        val wallet = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client.Caller(), this, LoggerFactory.default)
+        val wallet = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client, this, LoggerFactory.default)
         wallet.addAddress("16MmJT8VqW465GEyckWae547jKVfMB14P8")
         wallet.addAddress("14xb2HATmkBzrHf4CR2hZczEtjYpTh92d2")
         wallet.addAddress("1NHFyu1uJ1UoDjtPjqZ4Et3wNCyMGCJ1qV")
@@ -97,25 +116,29 @@ class ElectrumMiniWalletTest : LightningTestSuite() {
             }.toSet()
         )
 
+        wallet.stop()
         client.stop()
     }
 
     @Test
     fun `parallel wallets`() = runSuspendTest(timeout = 15.seconds) {
         val client = connectToMainnetServer()
-        val wallet1 = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client.Caller(), this, LoggerFactory.default, name = "addr-16MmJT")
-        val wallet2 = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client.Caller(), this, LoggerFactory.default, name = "addr-14xb2H")
+        val wallet1 = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client, this, LoggerFactory.default, name = "addr-16MmJT")
+        val wallet2 = ElectrumMiniWallet(Block.LivenetGenesisBlock.hash, client, this, LoggerFactory.default, name = "addr-14xb2H")
         wallet1.addAddress("16MmJT8VqW465GEyckWae547jKVfMB14P8")
         wallet2.addAddress("14xb2HATmkBzrHf4CR2hZczEtjYpTh92d2")
 
         val walletState1 = wallet1.walletStateFlow.filter { it.parentTxs.size == 4 }.first()
         val walletState2 = wallet2.walletStateFlow.filter { it.parentTxs.size == 6 }.first()
 
-        assertEquals(7200_0000.sat, walletState1.totalBalance)
-        assertEquals(3000_0000.sat, walletState2.totalBalance)
+        assertEquals(7_200_0000.sat, walletState1.totalBalance)
+        assertEquals(3_000_0000.sat, walletState2.totalBalance)
 
         assertEquals(4, walletState1.parentTxs.size)
         assertEquals(6, walletState2.parentTxs.size)
 
+        wallet1.stop()
+        wallet2.stop()
+        client.stop()
     }
 }

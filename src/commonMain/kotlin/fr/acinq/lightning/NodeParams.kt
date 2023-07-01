@@ -1,13 +1,18 @@
 package fr.acinq.lightning
 
-import fr.acinq.bitcoin.ByteVector32
+import fr.acinq.bitcoin.Block
 import fr.acinq.bitcoin.PublicKey
 import fr.acinq.bitcoin.Satoshi
 import fr.acinq.lightning.Lightning.nodeFee
+import fr.acinq.lightning.blockchain.fee.FeerateTolerance
 import fr.acinq.lightning.blockchain.fee.OnChainFeeConf
 import fr.acinq.lightning.crypto.KeyManager
+import fr.acinq.lightning.payment.LiquidityPolicy
+import fr.acinq.lightning.utils.msat
+import fr.acinq.lightning.utils.sat
 import fr.acinq.lightning.utils.toMilliSatoshi
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import org.kodein.log.LoggerFactory
@@ -34,11 +39,13 @@ data class InvoiceDefaultRoutingFees(val feeBase: MilliSatoshi, val feeProportio
  * @param trampolineNode address of the trampoline node used for outgoing payments.
  * @param trampolineFees ordered list of trampoline fees to try when making an outgoing payment.
  * @param invoiceDefaultRoutingFees default routing fees set in invoices when we don't have any channel.
+ * @param swapInConfirmations number of confirmations needed on swap-in transactions, before importing those funds into a channel.
  */
 data class WalletParams(
     val trampolineNode: NodeUri,
     val trampolineFees: List<TrampolineFees>,
-    val invoiceDefaultRoutingFees: InvoiceDefaultRoutingFees
+    val invoiceDefaultRoutingFees: InvoiceDefaultRoutingFees,
+    val swapInConfirmations: Int
 )
 
 /**
@@ -84,16 +91,15 @@ data class RecipientCltvExpiryParams(val min: CltvExpiryDelta, val max: CltvExpi
  * @param autoReconnect automatically reconnect to our peers.
  * @param initialRandomReconnectDelaySeconds delay before which we reconnect to our peers (will be randomized based on this value).
  * @param maxReconnectIntervalSeconds maximum delay between reconnection attempts.
- * @param chainHash bitcoin chain we're interested in (testnet or mainnet).
+ * @param chain bitcoin chain we're interested in.
  * @param channelFlags channel flags used to temporarily enable or disable channels.
  * @param paymentRequestExpirySeconds our Bolt 11 invoices will only be valid for this duration.
  * @param multiPartPaymentExpirySeconds number of seconds we will wait to receive all parts of a multi-part payment.
- * @param minFundingSatoshis minimum channel size.
- * @param maxFundingSatoshis maximum channel size.
  * @param maxPaymentAttempts maximum number of retries when attempting an outgoing payment.
  * @param paymentRecipientExpiryParams configure the expiry delta used for the final node when sending payments.
  * @param zeroConfPeers list of peers with whom we use zero-conf (note that this is a strong trust assumption).
  * @param enableTrampolinePayment enable trampoline payments.
+ * @param liquidityPolicy fee policy for liquidity events, can be modified at any time.
  */
 data class NodeParams(
     val loggerFactory: LoggerFactory,
@@ -123,19 +129,19 @@ data class NodeParams(
     val autoReconnect: Boolean,
     val initialRandomReconnectDelaySeconds: Long,
     val maxReconnectIntervalSeconds: Long,
-    val chainHash: ByteVector32,
+    val chain: Chain,
     val channelFlags: Byte,
     val paymentRequestExpirySeconds: Long,
     val multiPartPaymentExpirySeconds: Long,
-    val minFundingSatoshis: Satoshi,
-    val maxFundingSatoshis: Satoshi,
     val maxPaymentAttempts: Int,
     val paymentRecipientExpiryParams: RecipientCltvExpiryParams,
     val zeroConfPeers: Set<PublicKey>,
     val enableTrampolinePayment: Boolean,
+    val liquidityPolicy: MutableStateFlow<LiquidityPolicy>
 ) {
-    val nodePrivateKey get() = keyManager.nodeKey.privateKey
-    val nodeId get() = keyManager.nodeId
+    val nodePrivateKey get() = keyManager.nodeKeys.nodeKey.privateKey
+    val nodeId get() = keyManager.nodeKeys.nodeKey.publicKey
+    val chainHash get() = chain.chainHash
 
     internal val _nodeEvents = MutableSharedFlow<NodeEvents>()
     val nodeEvents: SharedFlow<NodeEvents> get() = _nodeEvents.asSharedFlow()
@@ -149,5 +155,82 @@ data class NodeParams(
         require(!features.hasFeature(Feature.TrustedSwapInClient)) { "${Feature.TrustedSwapInClient.rfcName} has been deprecated" }
         require(!features.hasFeature(Feature.TrustedSwapInProvider)) { "${Feature.TrustedSwapInProvider.rfcName} has been deprecated" }
         Features.validateFeatureGraph(features)
+    }
+
+    /**
+     * Library integrators should use this constructor and override values.
+     */
+    constructor(chain: Chain, loggerFactory: LoggerFactory, keyManager: KeyManager) : this(
+        loggerFactory = loggerFactory,
+        keyManager = keyManager,
+        alias = "lightning-kmp",
+        features = Features(
+            Feature.OptionDataLossProtect to FeatureSupport.Optional,
+            Feature.VariableLengthOnion to FeatureSupport.Mandatory,
+            Feature.PaymentSecret to FeatureSupport.Mandatory,
+            Feature.BasicMultiPartPayment to FeatureSupport.Optional,
+            Feature.Wumbo to FeatureSupport.Optional,
+            Feature.StaticRemoteKey to FeatureSupport.Mandatory,
+            Feature.AnchorOutputs to FeatureSupport.Optional, // can't set Mandatory because peers prefers AnchorOutputsZeroFeeHtlcTx
+            Feature.DualFunding to FeatureSupport.Mandatory,
+            Feature.ShutdownAnySegwit to FeatureSupport.Mandatory,
+            Feature.ChannelType to FeatureSupport.Mandatory,
+            Feature.PaymentMetadata to FeatureSupport.Optional,
+            Feature.ExperimentalTrampolinePayment to FeatureSupport.Optional,
+            Feature.ZeroReserveChannels to FeatureSupport.Optional,
+            Feature.WakeUpNotificationClient to FeatureSupport.Optional,
+            Feature.PayToOpenClient to FeatureSupport.Optional,
+            Feature.ChannelBackupClient to FeatureSupport.Optional,
+            Feature.ExperimentalSplice to FeatureSupport.Optional,
+        ),
+        dustLimit = 546.sat,
+        maxRemoteDustLimit = 600.sat,
+        onChainFeeConf = OnChainFeeConf(
+            closeOnOfflineMismatch = true,
+            updateFeeMinDiffRatio = 0.1,
+            feerateTolerance = FeerateTolerance(ratioLow = 0.01, ratioHigh = 100.0)
+        ),
+        maxHtlcValueInFlightMsat = 20_000_000_000L,
+        maxAcceptedHtlcs = 6,
+        expiryDeltaBlocks = CltvExpiryDelta(144),
+        fulfillSafetyBeforeTimeoutBlocks = CltvExpiryDelta(6),
+        checkHtlcTimeoutAfterStartupDelaySeconds = 15,
+        htlcMinimum = 1000.msat,
+        minDepthBlocks = 3,
+        toRemoteDelayBlocks = CltvExpiryDelta(2016),
+        maxToLocalDelayBlocks = CltvExpiryDelta(1008),
+        feeBase = 1000.msat,
+        feeProportionalMillionth = 100,
+        revocationTimeoutSeconds = 20,
+        authTimeoutSeconds = 10,
+        initTimeoutSeconds = 10,
+        pingIntervalSeconds = 30,
+        pingTimeoutSeconds = 10,
+        pingDisconnect = true,
+        autoReconnect = false,
+        initialRandomReconnectDelaySeconds = 5,
+        maxReconnectIntervalSeconds = 3600,
+        chain = chain,
+        channelFlags = 1,
+        paymentRequestExpirySeconds = 3600,
+        multiPartPaymentExpirySeconds = 60,
+        maxPaymentAttempts = 5,
+        enableTrampolinePayment = true,
+        zeroConfPeers = emptySet(),
+        paymentRecipientExpiryParams = RecipientCltvExpiryParams(CltvExpiryDelta(75), CltvExpiryDelta(200)),
+        liquidityPolicy = MutableStateFlow<LiquidityPolicy>(LiquidityPolicy.Auto(maxAbsoluteFee = 2_000.sat, maxRelativeFeeBasisPoints = 3_000 /* 3000 = 30 % */, skipAbsoluteFeeCheck = false))
+    )
+
+    sealed class Chain(val name: String, private val genesis: Block) {
+        object Regtest : Chain("Regtest", Block.RegtestGenesisBlock)
+        object Testnet : Chain("Testnet", Block.TestnetGenesisBlock)
+        object Mainnet : Chain("Mainnet", Block.LivenetGenesisBlock)
+
+        fun isMainnet(): Boolean = this is Mainnet
+        fun isTestnet(): Boolean = this is Testnet
+
+        val chainHash by lazy { genesis.hash }
+
+        override fun toString(): String = name
     }
 }

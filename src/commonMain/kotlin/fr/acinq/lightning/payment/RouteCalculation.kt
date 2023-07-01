@@ -3,8 +3,8 @@ package fr.acinq.lightning.payment
 import fr.acinq.bitcoin.ByteVector32
 import fr.acinq.bitcoin.Satoshi
 import fr.acinq.lightning.MilliSatoshi
-import fr.acinq.lightning.channel.ChannelState
-import fr.acinq.lightning.channel.Normal
+import fr.acinq.lightning.channel.states.ChannelState
+import fr.acinq.lightning.channel.states.Normal
 import fr.acinq.lightning.utils.Either
 import fr.acinq.lightning.utils.MDCLogger
 import fr.acinq.lightning.utils.UUID
@@ -23,7 +23,7 @@ class RouteCalculation(loggerFactory: LoggerFactory) {
 
         data class ChannelBalance(val c: Normal) {
             val balance: MilliSatoshi = c.commitments.availableBalanceForSend()
-            val capacity: Satoshi = c.commitments.commitInput.txOut.amount
+            val capacity: Satoshi = c.commitments.latest.fundingAmount
         }
 
         val sortedChannels = channels.values.filterIsInstance<Normal>().map { ChannelBalance(it) }.sortedBy { it.balance }.reversed()

@@ -2,8 +2,8 @@ package fr.acinq.lightning.channel
 
 import fr.acinq.bitcoin.*
 import fr.acinq.lightning.MilliSatoshi
+import fr.acinq.lightning.NodeParams
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
-
 import fr.acinq.lightning.crypto.LocalKeyManager
 import fr.acinq.lightning.tests.TestConstants
 import fr.acinq.lightning.transactions.Scripts
@@ -22,8 +22,8 @@ class RecoveryTestsCommon {
         val (alice1, _) = TestsHelper.addHtlc(MilliSatoshi(50000), alice, bob).first
 
         // Alice force-closes the channel and publishes her commit tx
-        val (_, actions) = alice1.process(ChannelCommand.ExecuteCommand(CMD_FORCECLOSE))
-        val transactions = actions.findTxs()
+        val (_, actions) = alice1.process(ChannelCommand.Close.ForceClose)
+        val transactions = actions.findPublishTxs()
         val commitTx = transactions[0]
         val aliceTx = transactions[1]
 
@@ -37,7 +37,7 @@ class RecoveryTestsCommon {
 
         // use Bob's mnemonic words to initialise his key manager
         val seed = MnemonicCode.toSeed(TestConstants.Bob.mnemonics, "").toByteVector32()
-        val keyManager = LocalKeyManager(seed, Block.RegtestGenesisBlock.hash)
+        val keyManager = LocalKeyManager(seed, NodeParams.Chain.Regtest, TestConstants.aliceSwapInServerXpub)
 
         // recompute our channel keys from the extracted funding pubkey and see if we can find and spend our output
         fun findAndSpend(fundingKey: PublicKey): Transaction? {
@@ -52,7 +52,7 @@ class RecoveryTestsCommon {
             )
             return when (mainTx) {
                 is Transactions.TxResult.Success -> {
-                    val sig = keyManager.sign(mainTx.result, channelKeys.paymentKey)
+                    val sig = Transactions.sign(mainTx.result, channelKeys.paymentKey)
                     val signedTx = Transactions.addSigs(mainTx.result, sig).tx
                     Transaction.correctlySpends(signedTx, commitTx, ScriptFlags.STANDARD_SCRIPT_VERIFY_FLAGS)
                     signedTx

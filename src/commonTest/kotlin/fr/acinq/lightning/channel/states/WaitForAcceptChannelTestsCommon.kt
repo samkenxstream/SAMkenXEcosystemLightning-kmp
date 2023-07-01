@@ -1,6 +1,5 @@
 package fr.acinq.lightning.channel.states
 
-import fr.acinq.bitcoin.Block
 import fr.acinq.bitcoin.ByteVector32
 import fr.acinq.bitcoin.Satoshi
 import fr.acinq.lightning.*
@@ -26,7 +25,7 @@ class WaitForAcceptChannelTestsCommon : LightningTestSuite() {
         val txAddInput = actions1.findOutgoingMessage<TxAddInput>()
         assertNotEquals(txAddInput.channelId, accept.temporaryChannelId)
         assertEquals(alice1.channelId, txAddInput.channelId)
-        assertEquals(alice1.state.channelFeatures, ChannelFeatures(setOf(Feature.StaticRemoteKey, Feature.AnchorOutputs)))
+        assertEquals(alice1.state.channelFeatures, ChannelFeatures(setOf(Feature.StaticRemoteKey, Feature.AnchorOutputs, Feature.DualFunding)))
     }
 
     @Test
@@ -37,7 +36,7 @@ class WaitForAcceptChannelTestsCommon : LightningTestSuite() {
         assertEquals(3, actions1.size)
         actions1.find<ChannelAction.ChannelId.IdAssigned>()
         actions1.findOutgoingMessage<TxAddInput>()
-        assertEquals(alice1.state.channelFeatures, ChannelFeatures(setOf(Feature.StaticRemoteKey, Feature.AnchorOutputs)))
+        assertEquals(alice1.state.channelFeatures, ChannelFeatures(setOf(Feature.StaticRemoteKey, Feature.AnchorOutputs, Feature.DualFunding)))
         assertEquals(ChannelEvents.Creating(alice1.state), actions1.find<ChannelAction.EmitEvent>().event)
     }
 
@@ -51,13 +50,13 @@ class WaitForAcceptChannelTestsCommon : LightningTestSuite() {
         actions1.find<ChannelAction.ChannelId.IdAssigned>()
         assertEquals(ChannelEvents.Creating(alice1.state), actions1.find<ChannelAction.EmitEvent>().event)
         actions1.findOutgoingMessage<TxAddInput>()
-        assertEquals(alice1.state.channelFeatures, ChannelFeatures(setOf(Feature.StaticRemoteKey, Feature.AnchorOutputs, Feature.ZeroReserveChannels)))
+        assertEquals(alice1.state.channelFeatures, ChannelFeatures(setOf(Feature.StaticRemoteKey, Feature.AnchorOutputs, Feature.ZeroReserveChannels, Feature.DualFunding)))
     }
 
     @Test
     fun `recv AcceptChannel -- missing channel type`() {
         val (alice, _, accept) = init()
-        val (alice1, actions1) = alice.process(ChannelCommand.MessageReceived(accept.copy(tlvStream = TlvStream(listOf()))))
+        val (alice1, actions1) = alice.process(ChannelCommand.MessageReceived(accept.copy(tlvStream = TlvStream.empty())))
         assertIs<LNChannel<Aborted>>(alice1)
         val error = actions1.hasOutgoingMessage<Error>()
         assertEquals(error, Error(accept.temporaryChannelId, MissingChannelType(accept.temporaryChannelId).message))
@@ -66,27 +65,18 @@ class WaitForAcceptChannelTestsCommon : LightningTestSuite() {
     @Test
     fun `recv AcceptChannel -- invalid channel type`() {
         val (alice, _, accept) = init()
-        val (alice1, actions1) = alice.process(ChannelCommand.MessageReceived(accept.copy(tlvStream = TlvStream(listOf(ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.Standard))))))
+        val (alice1, actions1) = alice.process(ChannelCommand.MessageReceived(accept.copy(tlvStream = TlvStream(ChannelTlv.ChannelTypeTlv(ChannelType.UnsupportedChannelType(Features.empty))))))
         assertIs<LNChannel<Aborted>>(alice1)
         val error = actions1.hasOutgoingMessage<Error>()
-        assertEquals(error, Error(accept.temporaryChannelId, InvalidChannelType(accept.temporaryChannelId, ChannelType.SupportedChannelType.AnchorOutputs, ChannelType.SupportedChannelType.Standard).message))
+        assertEquals(error, Error(accept.temporaryChannelId, InvalidChannelType(accept.temporaryChannelId, ChannelType.SupportedChannelType.AnchorOutputs, ChannelType.UnsupportedChannelType(Features.empty)).message))
     }
 
     @Test
     fun `recv AcceptChannel -- funding negative`() {
-        val (alice, _, accept) = init(bobFundingAmount = (-1).sat)
-        val (alice1, actions) = alice.process(ChannelCommand.MessageReceived(accept))
+        val (alice, _, accept) = init()
+        val (alice1, actions) = alice.process(ChannelCommand.MessageReceived(accept.copy(fundingAmount = (-1).sat)))
         val error = actions.findOutgoingMessage<Error>()
-        assertEquals(error, Error(accept.temporaryChannelId, InvalidFundingAmount(accept.temporaryChannelId, (-1).sat, 0.sat, alice.staticParams.nodeParams.maxFundingSatoshis).message))
-        assertIs<LNChannel<Aborted>>(alice1)
-    }
-
-    @Test
-    fun `recv AcceptChannel -- funding too high`() {
-        val (alice, _, accept) = init(bobFundingAmount = 30_000_000.sat)
-        val (alice1, actions) = alice.process(ChannelCommand.MessageReceived(accept))
-        val error = actions.findOutgoingMessage<Error>()
-        assertEquals(error, Error(accept.temporaryChannelId, InvalidFundingAmount(accept.temporaryChannelId, 30_000_000.sat, 0.sat, alice.staticParams.nodeParams.maxFundingSatoshis).message))
+        assertEquals(error, Error(accept.temporaryChannelId, InvalidFundingAmount(accept.temporaryChannelId, (-1).sat).message))
         assertIs<LNChannel<Aborted>>(alice1)
     }
 
@@ -117,7 +107,7 @@ class WaitForAcceptChannelTestsCommon : LightningTestSuite() {
         // we don't want their dust limit to be below 354
         val lowDustLimitSatoshis = 353.sat
         // but we only enforce it on mainnet
-        val aliceMainnet = alice.copy(ctx = alice.ctx.copy(staticParams = alice.ctx.staticParams.copy(nodeParams = alice.staticParams.nodeParams.copy(chainHash = Block.LivenetGenesisBlock.hash))))
+        val aliceMainnet = alice.copy(ctx = alice.ctx.copy(staticParams = alice.ctx.staticParams.copy(nodeParams = alice.staticParams.nodeParams.copy(chain = NodeParams.Chain.Mainnet))))
         val (alice1, actions1) = aliceMainnet.process(ChannelCommand.MessageReceived(accept.copy(dustLimit = lowDustLimitSatoshis)))
         assertIs<LNChannel<Aborted>>(alice1)
         val error = actions1.hasOutgoingMessage<Error>()
@@ -149,14 +139,6 @@ class WaitForAcceptChannelTestsCommon : LightningTestSuite() {
     fun `recv Error`() {
         val (alice, _, _) = init()
         val (alice1, actions1) = alice.process(ChannelCommand.MessageReceived(Error(ByteVector32.Zeroes, "oops")))
-        assertIs<LNChannel<Aborted>>(alice1)
-        assertTrue(actions1.isEmpty())
-    }
-
-    @Test
-    fun `recv CMD_CLOSE`() {
-        val (alice, _, _) = init()
-        val (alice1, actions1) = alice.process(ChannelCommand.ExecuteCommand(CMD_CLOSE(null, null)))
         assertIs<LNChannel<Aborted>>(alice1)
         assertTrue(actions1.isEmpty())
     }

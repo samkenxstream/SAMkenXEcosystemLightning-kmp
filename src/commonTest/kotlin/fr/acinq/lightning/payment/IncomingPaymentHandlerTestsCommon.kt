@@ -7,11 +7,12 @@ import fr.acinq.lightning.Lightning.randomBytes32
 import fr.acinq.lightning.MilliSatoshi
 import fr.acinq.lightning.ShortChannelId
 import fr.acinq.lightning.channel.*
+import fr.acinq.lightning.channel.ChannelAction
+import fr.acinq.lightning.channel.ChannelCommand
 import fr.acinq.lightning.crypto.sphinx.Sphinx
 import fr.acinq.lightning.db.InMemoryPaymentsDb
 import fr.acinq.lightning.db.IncomingPayment
 import fr.acinq.lightning.db.IncomingPaymentsDb
-import fr.acinq.lightning.db.PaymentTypeFilter
 import fr.acinq.lightning.io.PayToOpenResponseCommand
 import fr.acinq.lightning.io.WrappedChannelCommand
 import fr.acinq.lightning.router.ChannelHop
@@ -23,6 +24,7 @@ import fr.acinq.lightning.utils.*
 import fr.acinq.lightning.wire.*
 import kotlinx.coroutines.delay
 import kotlin.test.*
+import kotlin.time.Duration.Companion.milliseconds
 
 class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
 
@@ -36,29 +38,29 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
 
         // Step 1: alice ---> update_add_htlc ---> bob
 
-        var processResult = alice.processSameState(ChannelCommand.ExecuteCommand(cmdAddHtlc))
+        var processResult = alice.processSameState(cmdAddHtlc)
         alice = processResult.first
         var actions = processResult.second
         assertEquals(2, actions.size)
         val add = actions.findOutgoingMessage<UpdateAddHtlc>()
-        val aliceCmdSign = actions.findCommand<CMD_SIGN>()
+        val aliceCmdSign = actions.findCommand<ChannelCommand.Commitment.Sign>()
 
         processResult = bob.processSameState(ChannelCommand.MessageReceived(add))
         bob = processResult.first
         actions = processResult.second
         assertTrue { actions.filterIsInstance<ChannelAction.Message.Send>().isEmpty() }
 
-        assertTrue { alice.commitments.localChanges.proposed.size == 1 }
-        assertTrue { alice.commitments.localChanges.signed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.acked.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.proposed.size == 1 }
+        assertTrue { alice.commitments.changes.localChanges.signed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.acked.isEmpty() }
 
-        assertTrue { bob.commitments.remoteChanges.proposed.size == 1 }
-        assertTrue { bob.commitments.remoteChanges.acked.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.signed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.proposed.size == 1 }
+        assertTrue { bob.commitments.changes.remoteChanges.acked.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.signed.isEmpty() }
 
         // Step 2: alice ---> commitment_signed ---> bob
 
-        processResult = alice.processSameState(ChannelCommand.ExecuteCommand(aliceCmdSign))
+        processResult = alice.processSameState(aliceCmdSign)
         alice = processResult.first
         actions = processResult.second
         val aliceSig = actions.findOutgoingMessage<CommitSig>()
@@ -67,15 +69,15 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         bob = processResult.first
         actions = processResult.second
         val bobRev = actions.findOutgoingMessage<RevokeAndAck>()
-        val bobCmdSign = actions.findCommand<CMD_SIGN>()
+        val bobCmdSign = actions.findCommand<ChannelCommand.Commitment.Sign>()
 
-        assertTrue { alice.commitments.localChanges.proposed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.signed.size == 1 }
-        assertTrue { alice.commitments.localChanges.acked.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.proposed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.signed.size == 1 }
+        assertTrue { alice.commitments.changes.localChanges.acked.isEmpty() }
 
-        assertTrue { bob.commitments.remoteChanges.proposed.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.acked.size == 1 }
-        assertTrue { bob.commitments.remoteChanges.signed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.proposed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.acked.size == 1 }
+        assertTrue { bob.commitments.changes.remoteChanges.signed.isEmpty() }
 
         // Step 3: alice <--- revoke_and_ack <--- bob
 
@@ -84,17 +86,17 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         actions = processResult.second
         assertTrue { actions.filterIsInstance<ChannelAction.Message.Send>().isEmpty() }
 
-        assertTrue { alice.commitments.localChanges.proposed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.signed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.acked.size == 1 }
+        assertTrue { alice.commitments.changes.localChanges.proposed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.signed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.acked.size == 1 }
 
-        assertTrue { bob.commitments.remoteChanges.proposed.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.acked.size == 1 }
-        assertTrue { bob.commitments.remoteChanges.signed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.proposed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.acked.size == 1 }
+        assertTrue { bob.commitments.changes.remoteChanges.signed.isEmpty() }
 
         // Step 4: alice <--- commitment_signed <--- bob
 
-        processResult = bob.processSameState(ChannelCommand.ExecuteCommand(bobCmdSign))
+        processResult = bob.processSameState(bobCmdSign)
         bob = processResult.first
         actions = processResult.second
         val bobSig = actions.findOutgoingMessage<CommitSig>()
@@ -104,13 +106,13 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         actions = processResult.second
         val aliceRev = actions.findOutgoingMessage<RevokeAndAck>()
 
-        assertTrue { alice.commitments.localChanges.proposed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.signed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.acked.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.proposed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.signed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.acked.isEmpty() }
 
-        assertTrue { bob.commitments.remoteChanges.proposed.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.acked.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.signed.size == 1 }
+        assertTrue { bob.commitments.changes.remoteChanges.proposed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.acked.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.signed.size == 1 }
 
         // Step 5: alice ---> revoke_and_ack ---> bob
 
@@ -120,13 +122,13 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         assertTrue { actions.filterIsInstance<ChannelAction.Message.Send>().isEmpty() }
         assertTrue { actions.filterIsInstance<ChannelAction.ProcessIncomingHtlc>().size == 1 }
 
-        assertTrue { alice.commitments.localChanges.proposed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.signed.isEmpty() }
-        assertTrue { alice.commitments.localChanges.acked.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.proposed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.signed.isEmpty() }
+        assertTrue { alice.commitments.changes.localChanges.acked.isEmpty() }
 
-        assertTrue { bob.commitments.remoteChanges.proposed.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.acked.isEmpty() }
-        assertTrue { bob.commitments.remoteChanges.signed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.proposed.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.acked.isEmpty() }
+        assertTrue { bob.commitments.changes.remoteChanges.signed.isEmpty() }
     }
 
     @Test
@@ -139,12 +141,12 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
 
         assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
         result as IncomingPaymentHandler.ProcessAddResult.Accepted
-        val expected = ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(add.id, incomingPayment.preimage, commit = true))
+        val expected = ChannelCommand.Htlc.Settlement.Fulfill(add.id, incomingPayment.preimage, commit = true)
         assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
 
         assertEquals(result.incomingPayment.received, result.received)
         assertEquals(defaultAmount, result.received.amount)
-        assertEquals(setOf(IncomingPayment.ReceivedWith.LightningPayment(amount = defaultAmount, channelId = channelId, htlcId = 12)), result.received.receivedWith)
+        assertEquals(listOf(IncomingPayment.ReceivedWith.LightningPayment(amount = defaultAmount, channelId = channelId, htlcId = 12)), result.received.receivedWith)
 
         checkDbPayment(result.incomingPayment, paymentHandler.db)
     }
@@ -161,13 +163,39 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val expected = PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest.chainHash, payToOpenRequest.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
         assertEquals(setOf(expected), result.actions.toSet())
 
-        val newChannelUUID = result.received.receivedWith.filterIsInstance<IncomingPayment.ReceivedWith.NewChannel>().first().id
-        val expectedFees = defaultAmount * 0.1 // 10% fees
-        assertEquals(defaultAmount - expectedFees, result.received.amount)
-        assertEquals(expectedFees, result.received.fees)
-        assertEquals(setOf(IncomingPayment.ReceivedWith.NewChannel(id = newChannelUUID, amount = defaultAmount - expectedFees, serviceFee = expectedFees, channelId = null)), result.received.receivedWith)
+        // the pay-to-open part is not yet inserted in db
+        assertTrue(result.received.receivedWith.isEmpty())
+        assertEquals(0.msat, result.received.amount)
+        assertEquals(0.msat, result.received.fees)
 
-        checkDbPayment(result.incomingPayment, paymentHandler.db)
+        // later on, a channel is created
+        val channelId = randomBytes32()
+        val amountOrigin = ChannelAction.Storage.StoreIncomingPayment.ViaNewChannel(
+            amount = payToOpenRequest.amountMsat,
+            serviceFee = payToOpenRequest.payToOpenFeeSatoshis.toMilliSatoshi(),
+            miningFee = 0.sat,
+            localInputs = emptySet(),
+            txId = randomBytes32(),
+            origin = Origin.PayToOpenOrigin(amount = payToOpenRequest.amountMsat, paymentHash = payToOpenRequest.paymentHash, serviceFee = 0.msat, miningFee = payToOpenRequest.payToOpenFeeSatoshis)
+        )
+        paymentHandler.process(channelId, amountOrigin)
+        paymentHandler.db.getIncomingPayment(payToOpenRequest.paymentHash).also { dbPayment ->
+            assertNotNull(dbPayment)
+            assertIs<IncomingPayment.Origin.Invoice>(dbPayment.origin)
+            assertNotNull(dbPayment.received)
+            assertEquals(1, dbPayment.received!!.receivedWith.size)
+            dbPayment.received!!.receivedWith.first().also { part ->
+                assertIs<IncomingPayment.ReceivedWith.NewChannel>(part)
+                assertEquals(amountOrigin.amount, part.amount)
+                assertEquals(amountOrigin.serviceFee, part.serviceFee)
+                assertEquals(amountOrigin.miningFee, part.miningFee)
+                assertEquals(channelId, part.channelId)
+                assertNull(part.confirmedAt)
+            }
+            assertEquals(amountOrigin.amount, dbPayment.received?.amount)
+            assertEquals(amountOrigin.serviceFee, dbPayment.received?.fees)
+        }
+
     }
 
     @Test
@@ -185,17 +213,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val expected = PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest1.chainHash, payToOpenRequest1.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
         assertEquals(setOf(expected), (result1.actions + result2.actions).toSet())
 
-        val expectedFees = defaultAmount * 0.1 // 10% fees
-        assertEquals(defaultAmount - expectedFees, result2.received.amount)
-        assertEquals(expectedFees, result2.received.fees)
-
-        val (id1, id2) = result2.received.receivedWith.map { (it as IncomingPayment.ReceivedWith.NewChannel).id }
-        assertEquals(setOf(
-            makeReceivedWithNewChannel(payToOpenRequest1, uuid = id1),
-            makeReceivedWithNewChannel(payToOpenRequest2, uuid = id2)
-        ), result2.received.receivedWith)
-
-        checkDbPayment(result2.incomingPayment, paymentHandler.db)
+        // pay-to-open parts are not yet inserted in db
+        assertTrue(result2.received.receivedWith.isEmpty())
     }
 
     @Test
@@ -207,21 +226,14 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
 
         val result1 = paymentHandler.process(payToOpenRequest1, TestConstants.defaultBlockHeight)
         assertIs<IncomingPaymentHandler.ProcessAddResult.Pending>(result1)
+        assertEquals(emptyList(), result1.actions)
         val result2 = paymentHandler.process(payToOpenRequest2, TestConstants.defaultBlockHeight)
         assertIs<IncomingPaymentHandler.ProcessAddResult.Accepted>(result2)
+        val payToOpenResponse = PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest1.chainHash, payToOpenRequest1.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
+        assertEquals(listOf(payToOpenResponse), result2.actions)
 
-        val expected = PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest1.chainHash, payToOpenRequest1.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
-        assertEquals(setOf(expected), (result1.actions + result2.actions).toSet())
-
-        val expectedFees = defaultAmount * 0.1 // 10% fees
-        assertEquals(defaultAmount - expectedFees, result2.received.amount)
-        assertEquals(expectedFees, result2.received.fees)
-
-        val (id1, id2) = result2.received.receivedWith.map { (it as IncomingPayment.ReceivedWith.NewChannel).id }
-        assertEquals(setOf(
-            makeReceivedWithNewChannel(payToOpenRequest1, uuid = id1),
-            makeReceivedWithNewChannel(payToOpenRequest2, uuid = id2)
-        ), result2.received.receivedWith)
+        assertEquals(0.msat, result2.received.amount)
+        assertEquals(0.msat, result2.received.fees)
 
         checkDbPayment(result2.incomingPayment, paymentHandler.db)
     }
@@ -258,7 +270,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
                         paymentHandler.nodeParams.nodePrivateKey,
                         payToOpenRequest.paymentHash,
                         payToOpenRequest.finalPacket,
-                        CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
+                        ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
                     ).right!!
                 )
             )
@@ -284,7 +296,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
                         paymentHandler.nodeParams.nodePrivateKey,
                         payToOpenRequest.paymentHash,
                         payToOpenRequest.finalPacket,
-                        CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
+                        ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
                     ).right!!
                 )
             )
@@ -293,9 +305,9 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
     }
 
     @Test
-    fun `receive pay-to-open payment with an amount too low`() = runSuspendTest {
+    fun `receive pay-to-open payment with a fee too high`() = runSuspendTest {
         val (paymentHandler, incomingPayment, paymentSecret) = createFixture(defaultAmount)
-        val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(defaultAmount, defaultAmount, paymentSecret), payToOpenMinAmount = defaultAmount + 1.msat) // <--- just below the min pay-to-open amount
+        val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(defaultAmount, defaultAmount, paymentSecret)).copy(payToOpenFeeSatoshis = 2_000.sat)
         val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
 
         assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
@@ -310,40 +322,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
                         paymentHandler.nodeParams.nodePrivateKey,
                         payToOpenRequest.paymentHash,
                         payToOpenRequest.finalPacket,
-                        CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
-                    ).right!!
-                )
-            )
-        )
-        assertEquals(setOf(expected), result.actions.toSet())
-    }
-
-    @Test
-    fun `receive pay-to-open payment with a funding amount too low`() = runSuspendTest {
-        val (paymentHandler, incomingPayment, paymentSecret) = run {
-            val (paymentHandler, incomingPayment, paymentSecret) = createFixture(defaultAmount)
-            val paymentHandler1 = IncomingPaymentHandler(paymentHandler.nodeParams.copy(minFundingSatoshis = 200_000.sat), paymentHandler.walletParams, paymentHandler.db)
-            Triple(paymentHandler1, incomingPayment, paymentSecret)
-        }
-
-        val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(defaultAmount, defaultAmount, paymentSecret))
-        // we make sure that the pay-to-open funding amount is invalid
-        assertTrue { payToOpenRequest.fundingSatoshis < paymentHandler.nodeParams.minFundingSatoshis }
-        val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
-
-        assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-        result as IncomingPaymentHandler.ProcessAddResult.Rejected
-        assertEquals(incomingPayment, result.incomingPayment)
-        val expected = PayToOpenResponseCommand(
-            PayToOpenResponse(
-                payToOpenRequest.chainHash,
-                payToOpenRequest.paymentHash,
-                PayToOpenResponse.Result.Failure(
-                    OutgoingPaymentPacket.buildHtlcFailure(
-                        paymentHandler.nodeParams.nodePrivateKey,
-                        payToOpenRequest.paymentHash,
-                        payToOpenRequest.finalPacket,
-                        CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
+                        ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(TemporaryNodeFailure)
                     ).right!!
                 )
             )
@@ -386,69 +365,12 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
                         paymentHandler.nodeParams.nodePrivateKey,
                         payToOpenRequest.paymentHash,
                         payToOpenRequest.finalPacket,
-                        CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
+                        ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(payToOpenRequest.amountMsat, TestConstants.defaultBlockHeight.toLong()))
                     ).right!!
                 )
             )
         )
         assertEquals(setOf(expected), result.actions.toSet())
-    }
-
-    @Test
-    fun `process incoming amount with unknown origin`() = runSuspendTest {
-        val channelId = randomBytes32()
-        val amountOrigin = ChannelAction.Storage.StoreIncomingAmount(amount = 15_000_000.msat, localInputs = setOf(), origin = null)
-        val handler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, TestConstants.Bob.walletParams, InMemoryPaymentsDb())
-        handler.process(channelId, amountOrigin)
-        val dbPayment = handler.db.getIncomingPayment(channelId.sha256().sha256())
-        assertNotNull(dbPayment)
-        assertTrue { dbPayment.origin is IncomingPayment.Origin.SwapIn }
-        val newChannelUUID = dbPayment.received!!.receivedWith.filterIsInstance<IncomingPayment.ReceivedWith.NewChannel>().first().id
-        assertEquals(setOf(IncomingPayment.ReceivedWith.NewChannel(id = newChannelUUID, amount = amountOrigin.amount, serviceFee = 0.msat, channelId = channelId)), dbPayment.received?.receivedWith)
-        assertEquals(15_000_000.msat, dbPayment.received?.amount)
-    }
-
-    @Test
-    fun `process incoming amount with pay-to-open origin`() = runSuspendTest {
-        val preimage = randomBytes32()
-        val channelId = randomBytes32()
-        val amountOrigin = ChannelAction.Storage.StoreIncomingAmount(
-            amount = 15_000_000.msat,
-            localInputs = setOf(),
-            origin = ChannelOrigin.PayToOpenOrigin(paymentHash = preimage.sha256(), fee = 1_000.sat)
-        )
-        val handler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, TestConstants.Bob.walletParams, InMemoryPaymentsDb())
-        // simulate payment processed as a pay-to-open
-        handler.db.addIncomingPayment(preimage, IncomingPayment.Origin.KeySend)
-        val newChannelUUID = UUID.randomUUID()
-        handler.db.receivePayment(preimage.sha256(), receivedWith = setOf(IncomingPayment.ReceivedWith.NewChannel(id = newChannelUUID, amount = 15_000_000.msat, serviceFee = 1_000_000.msat, channelId = null)))
-        // process the amount origin which must reconcile with the existing line in the database
-        handler.process(channelId, amountOrigin)
-        val dbPayment = handler.db.getIncomingPayment(preimage.sha256())
-        assertNotNull(dbPayment)
-        assertIs<IncomingPayment.Origin.KeySend>(dbPayment.origin)
-        assertEquals(setOf(IncomingPayment.ReceivedWith.NewChannel(id = newChannelUUID, amount = 15_000_000.msat, serviceFee = 1_000_000.msat, channelId = channelId)), dbPayment.received?.receivedWith)
-        assertEquals(15_000_000.msat, dbPayment.received?.amount)
-        assertEquals(1_000_000.msat, dbPayment.received?.fees)
-    }
-
-    @Test
-    fun `process incoming amount with please-open-channel origin`() = runSuspendTest {
-        val channelId = randomBytes32()
-        val amountOrigin = ChannelAction.Storage.StoreIncomingAmount(
-            amount = 33_000_000.msat,
-            localInputs = setOf(OutPoint(randomBytes32(), 7)),
-            origin = ChannelOrigin.PleaseOpenChannelOrigin(randomBytes32(), 1_200_000.msat, 0.sat)
-        )
-        val handler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, TestConstants.Bob.walletParams, InMemoryPaymentsDb())
-        handler.process(channelId, amountOrigin)
-        val dbPayment = handler.db.getIncomingPayment(channelId.sha256().sha256())
-        assertNotNull(dbPayment)
-        assertIs<IncomingPayment.Origin.DualSwapIn>(dbPayment.origin)
-        val newChannelUUID = dbPayment.received!!.receivedWith.filterIsInstance<IncomingPayment.ReceivedWith.NewChannel>().first().id
-        assertEquals(setOf(IncomingPayment.ReceivedWith.NewChannel(id = newChannelUUID, amount = 33_000_000.msat, serviceFee = 1_200_000.msat, channelId = channelId)), dbPayment.received?.receivedWith)
-        assertEquals(33_000_000.msat, dbPayment.received?.amount)
-        assertEquals(1_200_000.msat, dbPayment.received?.fees)
     }
 
     @Test
@@ -479,14 +401,14 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
             result as IncomingPaymentHandler.ProcessAddResult.Accepted
             val (expectedActions, expectedReceivedWith) = setOf(
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(0, defaultPreimage, commit = true)))
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(0, defaultPreimage, commit = true))
                         to IncomingPayment.ReceivedWith.LightningPayment(amount1, channelId, 0),
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(1, defaultPreimage, commit = true)))
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(1, defaultPreimage, commit = true))
                         to IncomingPayment.ReceivedWith.LightningPayment(amount2, channelId, 1),
             ).unzip()
             assertEquals(expectedActions.toSet(), result.actions.toSet())
             assertEquals(totalAmount, result.received.amount)
-            assertEquals(expectedReceivedWith.toSet(), result.received.receivedWith)
+            assertEquals(expectedReceivedWith, result.received.receivedWith)
             checkDbPayment(result.incomingPayment, paymentHandler.db)
         }
     }
@@ -517,14 +439,14 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
             result as IncomingPaymentHandler.ProcessAddResult.Accepted
             val (expectedActions, expectedReceivedWith) = setOf(
-                WrappedChannelCommand(channelId1, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(7, defaultPreimage, commit = true)))
+                WrappedChannelCommand(channelId1, ChannelCommand.Htlc.Settlement.Fulfill(7, defaultPreimage, commit = true))
                         to IncomingPayment.ReceivedWith.LightningPayment(amount1, channelId1, 7),
-                WrappedChannelCommand(channelId2, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(5, defaultPreimage, commit = true)))
+                WrappedChannelCommand(channelId2, ChannelCommand.Htlc.Settlement.Fulfill(5, defaultPreimage, commit = true))
                         to IncomingPayment.ReceivedWith.LightningPayment(amount2, channelId2, 5),
             ).unzip()
             assertEquals(expectedActions.toSet(), result.actions.toSet())
             assertEquals(totalAmount, result.received.amount)
-            assertEquals(expectedReceivedWith.toSet(), result.received.receivedWith)
+            assertEquals(expectedReceivedWith, result.received.receivedWith)
             checkDbPayment(result.incomingPayment, paymentHandler.db)
         }
     }
@@ -532,7 +454,6 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
     @Test
     fun `receive multipart payment via pay-to-open`() = runSuspendTest {
         val (amount1, amount2) = Pair(100_000.msat, 50_000.msat)
-        val (fee1, fee2) = Pair(amount1 * 0.1, amount2 * 0.1)
         val totalAmount = amount1 + amount2
         val (paymentHandler, incomingPayment, paymentSecret) = createFixture(totalAmount)
 
@@ -542,7 +463,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         run {
             val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(amount1, totalAmount, paymentSecret))
             val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Pending }
+            assertIs<IncomingPaymentHandler.ProcessAddResult.Pending>(result)
             assertTrue { result.actions.isEmpty() }
         }
 
@@ -552,20 +473,15 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         run {
             val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(amount2, totalAmount, paymentSecret))
             val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
-            result as IncomingPaymentHandler.ProcessAddResult.Accepted
-            val (id1, id2) = result.received.receivedWith.map { (it as IncomingPayment.ReceivedWith.NewChannel).id }
-            val (expectedActions, expectedReceivedWith) = setOf(
-                PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest.chainHash, payToOpenRequest.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
-                        to IncomingPayment.ReceivedWith.NewChannel(id = id1, amount1 - fee1, fee1, channelId = null),
-                PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest.chainHash, payToOpenRequest.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
-                        to IncomingPayment.ReceivedWith.NewChannel(id = id2, amount2 - fee2, fee2, channelId = null)
-            ).unzip()
-            assertEquals(expectedActions.toSet(), result.actions.toSet())
-            val expectedFees = 15_000.msat // 10% of 150_000 msat
-            assertEquals(totalAmount - expectedFees, result.received.amount)
-            assertEquals(expectedFees, result.received.fees)
-            assertEquals(expectedReceivedWith.toSet(), result.received.receivedWith)
+            assertIs<IncomingPaymentHandler.ProcessAddResult.Accepted>(result)
+
+            val payToOpenResponse = PayToOpenResponse(payToOpenRequest.chainHash, payToOpenRequest.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage))
+            assertEquals(result.actions, listOf(PayToOpenResponseCommand(payToOpenResponse)))
+
+            // pay-to-open parts are not yet provided
+            assertTrue { result.received.receivedWith.isEmpty() }
+            assertEquals(0.msat, result.received.fees)
+
             checkDbPayment(result.incomingPayment, paymentHandler.db)
         }
     }
@@ -574,7 +490,6 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
     fun `receive multipart payment with a mix of HTLC and pay-to-open`() = runSuspendTest {
         val channelId = randomBytes32()
         val (amount1, amount2) = Pair(100_000.msat, 50_000.msat)
-        val fee2 = amount2 * 0.1
         val totalAmount = amount1 + amount2
         val (paymentHandler, incomingPayment, paymentSecret) = createFixture(totalAmount)
 
@@ -584,7 +499,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         run {
             val add = makeUpdateAddHtlc(0, channelId, paymentHandler, incomingPayment.paymentHash, makeMppPayload(amount1, totalAmount, paymentSecret))
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Pending }
+            assertIs<IncomingPaymentHandler.ProcessAddResult.Pending>(result)
             assertTrue { result.actions.isEmpty() }
         }
 
@@ -594,26 +509,23 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         run {
             val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(amount2, totalAmount, paymentSecret))
             val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
-            result as IncomingPaymentHandler.ProcessAddResult.Accepted
-            val newChannelUUID = result.received.receivedWith.filterIsInstance<IncomingPayment.ReceivedWith.NewChannel>().first().id
-            val (expectedActions, expectedReceivedWith) = setOf(
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(0, incomingPayment.preimage, commit = true)))
-                        to IncomingPayment.ReceivedWith.LightningPayment(amount1, channelId, 0),
-                PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest.chainHash, payToOpenRequest.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage)))
-                        to IncomingPayment.ReceivedWith.NewChannel(id = newChannelUUID, amount2 - fee2, fee2, channelId = null),
-            ).unzip()
-            assertEquals(expectedActions.toSet(), result.actions.toSet())
-            val expectedFees = 5_000.msat // 10% of the amount sent via pay-to-open (50 000 msat)
-            assertEquals(totalAmount - expectedFees, result.received.amount)
-            assertEquals(expectedFees, result.received.fees)
-            assertEquals(expectedReceivedWith.toSet(), result.received.receivedWith)
+            assertIs<IncomingPaymentHandler.ProcessAddResult.Accepted>(result)
+
+            assertEquals(2, result.actions.size)
+            assertContains(result.actions, WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(0, incomingPayment.preimage, commit = true)))
+            assertContains(result.actions, PayToOpenResponseCommand(PayToOpenResponse(payToOpenRequest.chainHash, payToOpenRequest.paymentHash, PayToOpenResponse.Result.Success(incomingPayment.preimage))))
+
+            // the pay-to-open part is not yet provided
+            assertEquals(1, result.received.receivedWith.size)
+            assertContains(result.received.receivedWith, IncomingPayment.ReceivedWith.LightningPayment(amount1, channelId, 0))
+            assertEquals(0.msat, result.received.fees)
+
             checkDbPayment(result.incomingPayment, paymentHandler.db)
         }
     }
 
     @Test
-    fun `receive multipart payment with a mix of HTLC and pay-to-open -- total amount too low`() = runSuspendTest {
+    fun `receive multipart payment with a mix of HTLC and pay-to-open -- fee too high`() = runSuspendTest {
         val channelId = randomBytes32()
         val (amount1, amount2) = Pair(100_000.msat, 50_000.msat)
         val totalAmount = amount1 + amount2
@@ -633,13 +545,13 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         // - Alice sends second multipart htlc to Bob
         // - Bob has received the complete MPP set
         run {
-            val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(amount2, totalAmount, paymentSecret), payToOpenMinAmount = 200_000.msat)
+            val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(amount2, totalAmount, paymentSecret)).copy(payToOpenFeeSatoshis = 2_000.sat)
             val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
             val expected = setOf(
                 WrappedChannelCommand(
                     channelId,
-                    ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(0, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+                    ChannelCommand.Htlc.Settlement.Fail(0, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(TemporaryNodeFailure), commit = true)
                 ),
                 PayToOpenResponseCommand(
                     PayToOpenResponse(
@@ -650,84 +562,11 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
                                 paymentHandler.nodeParams.nodePrivateKey,
                                 payToOpenRequest.paymentHash,
                                 payToOpenRequest.finalPacket,
-                                CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong()))
+                                ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(TemporaryNodeFailure)
                             ).right!!
                         )
                     )
                 )
-            )
-            assertEquals(expected, result.actions.toSet())
-        }
-    }
-
-    @Test
-    fun `receive multipart payment with a mix of HTLC and pay-to-open -- amount of the pay-to-open parts too low`() = runSuspendTest {
-        val channelId = randomBytes32()
-        val (amount1, amount2, amount3) = Triple(100_000.msat, 30_000.msat, 20_000.msat)
-        val totalAmount = amount1 + amount2 + amount3
-        val (paymentHandler, incomingPayment, paymentSecret) = createFixture(totalAmount)
-
-        // Step 1 of 3:
-        // - Alice sends first multipart htlc to Bob
-        // - Bob doesn't accept the MPP set yet
-        run {
-            val add = makeUpdateAddHtlc(0, channelId, paymentHandler, incomingPayment.paymentHash, makeMppPayload(amount1, totalAmount, paymentSecret))
-            val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Pending }
-            assertTrue { result.actions.isEmpty() }
-        }
-
-        // Step 2 of 3:
-        // - Alice sends second multipart htlc to Bob
-        // - Bob doesn't accept the MPP set yet
-        val payToOpenRequest1 = run {
-            val payToOpenRequest = makePayToOpenRequest(incomingPayment, makeMppPayload(amount2, totalAmount, paymentSecret), payToOpenMinAmount = 75_000.msat)
-            val result = paymentHandler.process(payToOpenRequest, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Pending }
-            assertTrue { result.actions.isEmpty() }
-            payToOpenRequest
-        }
-
-        // Step 3 of 3:
-        // - Alice sends last multipart htlc to Bob
-        // - Bob has received the complete MPP set
-        run {
-            val payToOpenRequest2 = makePayToOpenRequest(incomingPayment, makeMppPayload(amount3, totalAmount, paymentSecret), payToOpenMinAmount = 75_000.msat)
-            val result = paymentHandler.process(payToOpenRequest2, TestConstants.defaultBlockHeight)
-            assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-            val expected = setOf(
-                WrappedChannelCommand(
-                    channelId,
-                    ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(0, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
-                ),
-                PayToOpenResponseCommand(
-                    PayToOpenResponse(
-                        payToOpenRequest1.chainHash,
-                        payToOpenRequest1.paymentHash,
-                        PayToOpenResponse.Result.Failure(
-                            OutgoingPaymentPacket.buildHtlcFailure(
-                                paymentHandler.nodeParams.nodePrivateKey,
-                                payToOpenRequest1.paymentHash,
-                                payToOpenRequest1.finalPacket,
-                                CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong()))
-                            ).right!!
-                        )
-                    )
-                ),
-                PayToOpenResponseCommand(
-                    PayToOpenResponse(
-                        payToOpenRequest2.chainHash,
-                        payToOpenRequest2.paymentHash,
-                        PayToOpenResponse.Result.Failure(
-                            OutgoingPaymentPacket.buildHtlcFailure(
-                                paymentHandler.nodeParams.nodePrivateKey,
-                                payToOpenRequest2.paymentHash,
-                                payToOpenRequest2.finalPacket,
-                                CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong()))
-                            ).right!!
-                        )
-                    )
-                ),
             )
             assertEquals(expected, result.actions.toSet())
         }
@@ -740,7 +579,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
 
         assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
-        val expected = WrappedChannelCommand(add.channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(add.id, incomingPayment.preimage, commit = true)))
+        val expected = WrappedChannelCommand(add.channelId, ChannelCommand.Htlc.Settlement.Fulfill(add.id, incomingPayment.preimage, commit = true))
         assertEquals(setOf(expected), result.actions.toSet())
     }
 
@@ -769,8 +608,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
             val expected = setOf(
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(7, incomingPayment.preimage, commit = true))),
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(11, incomingPayment.preimage, commit = true))),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(7, incomingPayment.preimage, commit = true)),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(11, incomingPayment.preimage, commit = true)),
             )
             assertEquals(expected, result.actions.toSet())
         }
@@ -802,9 +641,9 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
             val expected = setOf(
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(3, incomingPayment.preimage, commit = true))),
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(5, incomingPayment.preimage, commit = true))),
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(6, incomingPayment.preimage, commit = true)))
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(3, incomingPayment.preimage, commit = true)),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(5, incomingPayment.preimage, commit = true)),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(6, incomingPayment.preimage, commit = true))
             )
             assertEquals(expected, result.actions.toSet())
         }
@@ -832,8 +671,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         result2 as IncomingPaymentHandler.ProcessAddResult.Accepted
         assertEquals(defaultAmount, result2.received.amount)
         val expected = setOf(
-            WrappedChannelCommand(add1.channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(add1.id, incomingPayment.preimage, commit = true))),
-            WrappedChannelCommand(add2.channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(add2.id, incomingPayment.preimage, commit = true)))
+            WrappedChannelCommand(add1.channelId, ChannelCommand.Htlc.Settlement.Fulfill(add1.id, incomingPayment.preimage, commit = true)),
+            WrappedChannelCommand(add2.channelId, ChannelCommand.Htlc.Settlement.Fulfill(add2.id, incomingPayment.preimage, commit = true))
         )
         assertEquals(expected, result2.actions.toSet())
 
@@ -842,7 +681,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         assertTrue { result2b is IncomingPaymentHandler.ProcessAddResult.Accepted }
         result2b as IncomingPaymentHandler.ProcessAddResult.Accepted
         assertEquals(defaultAmount, result2b.received.amount)
-        assertEquals(listOf(WrappedChannelCommand(add2.channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(add2.id, incomingPayment.preimage, commit = true)))), result2b.actions)
+        assertEquals(listOf(WrappedChannelCommand(add2.channelId, ChannelCommand.Htlc.Settlement.Fulfill(add2.id, incomingPayment.preimage, commit = true))), result2b.actions)
     }
 
     @Test
@@ -857,7 +696,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
 
         // It expires after a while.
         val actions1 = paymentHandler.checkPaymentsTimeout(currentTimestampSeconds() + paymentHandler.nodeParams.multiPartPaymentExpirySeconds + 2)
-        val addTimeout = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(PaymentTimeout), commit = true))
+        val addTimeout = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(PaymentTimeout), commit = true)
         assertEquals(listOf(WrappedChannelCommand(add.channelId, addTimeout)), actions1)
 
         // For some reason, the channel was offline, didn't process the failure and retransmits the htlc.
@@ -873,13 +712,13 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val currentBlockHeight = add.cltvExpiry.toLong().toInt() - 3
         val result3 = paymentHandler.process(add, currentBlockHeight)
         assertTrue { result3 is IncomingPaymentHandler.ProcessAddResult.Rejected }
-        val addExpired = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, currentBlockHeight.toLong())), commit = true))
+        val addExpired = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, currentBlockHeight.toLong())), commit = true)
         assertEquals(listOf(WrappedChannelCommand(add.channelId, addExpired)), result3.actions)
     }
 
     @Test
     fun `invoice expired`() = runSuspendTest {
-        val paymentHandler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, TestConstants.Bob.walletParams, InMemoryPaymentsDb())
+        val paymentHandler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, InMemoryPaymentsDb())
         val (incomingPayment, paymentSecret) = makeIncomingPayment(
             payee = paymentHandler,
             amount = defaultAmount,
@@ -890,7 +729,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
 
         assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-        val expected = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+        val expected = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, TestConstants.defaultBlockHeight.toLong())), commit = true)
         assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
     }
 
@@ -901,7 +740,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
 
         assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-        val expected = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+        val expected = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, TestConstants.defaultBlockHeight.toLong())), commit = true)
         assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
     }
 
@@ -920,7 +759,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         // 2. InvalidOnionHmac
         // Since we used a valid pubKey, we should get an hmac failure.
         val expectedErr = InvalidOnionHmac(Sphinx.hash(badOnion))
-        val expected = ChannelCommand.ExecuteCommand(CMD_FAIL_MALFORMED_HTLC(add.id, expectedErr.onionHash, expectedErr.code, commit = true))
+        val expected = ChannelCommand.Htlc.Settlement.FailMalformed(add.id, expectedErr.onionHash, expectedErr.code, commit = true)
         assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
     }
 
@@ -932,7 +771,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
 
         assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-        val expected = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+        val expected = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(defaultAmount, TestConstants.defaultBlockHeight.toLong())), commit = true)
         assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
     }
 
@@ -949,7 +788,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val add = makeUpdateAddHtlc(3, randomBytes32(), paymentHandler, incomingPayment.paymentHash, payload)
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-            val expected = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(payload.totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+            val expected = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(payload.totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true)
             assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
         }
     }
@@ -983,11 +822,11 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val expected = setOf(
                 WrappedChannelCommand(
                     channelId,
-                    ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(1, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+                    ChannelCommand.Htlc.Settlement.Fail(1, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true)
                 ),
                 WrappedChannelCommand(
                     channelId,
-                    ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(2, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount + 1.msat, TestConstants.defaultBlockHeight.toLong())), commit = true))
+                    ChannelCommand.Htlc.Settlement.Fail(2, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount + 1.msat, TestConstants.defaultBlockHeight.toLong())), commit = true)
                 ),
             )
             assertEquals(expected, result.actions.toSet())
@@ -1018,7 +857,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val add = makeUpdateAddHtlc(1, randomBytes32(), paymentHandler, incomingPayment.paymentHash, payload)
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
-            val expected = ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(add.id, CMD_FAIL_HTLC.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true))
+            val expected = ChannelCommand.Htlc.Settlement.Fail(add.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())), commit = true)
             assertEquals(setOf(WrappedChannelCommand(add.channelId, expected)), result.actions.toSet())
         }
     }
@@ -1054,8 +893,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val currentTimestampSeconds = startTime + paymentHandler.nodeParams.multiPartPaymentExpirySeconds + 2
             val actions = paymentHandler.checkPaymentsTimeout(currentTimestampSeconds)
             val expected = setOf(
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(1, CMD_FAIL_HTLC.Reason.Failure(PaymentTimeout), commit = true))),
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(2, CMD_FAIL_HTLC.Reason.Failure(PaymentTimeout), commit = true))),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fail(1, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(PaymentTimeout), commit = true)),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fail(2, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(PaymentTimeout), commit = true)),
             )
             assertEquals(expected, actions.toSet())
         }
@@ -1083,7 +922,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         run {
             val currentTimestampSeconds = startTime + paymentHandler.nodeParams.multiPartPaymentExpirySeconds + 2
             val actions = paymentHandler.checkPaymentsTimeout(currentTimestampSeconds)
-            val expected = WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FAIL_HTLC(1, CMD_FAIL_HTLC.Reason.Failure(PaymentTimeout), commit = true)))
+            val expected = WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fail(1, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(PaymentTimeout), commit = true))
             assertEquals(setOf(expected), actions.toSet())
         }
 
@@ -1104,8 +943,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
             val expected = setOf(
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(3, incomingPayment.preimage, commit = true))),
-                WrappedChannelCommand(channelId, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(4, incomingPayment.preimage, commit = true))),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(3, incomingPayment.preimage, commit = true)),
+                WrappedChannelCommand(channelId, ChannelCommand.Htlc.Settlement.Fulfill(4, incomingPayment.preimage, commit = true)),
             )
             assertEquals(expected, result.actions.toSet())
         }
@@ -1133,8 +972,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             assertTrue { result2 is IncomingPaymentHandler.ProcessAddResult.Accepted }
 
             val expected = setOf(
-                WrappedChannelCommand(channelId1, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlc1.id, incomingPayment.preimage, commit = true))),
-                WrappedChannelCommand(channelId2, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlc2.id, incomingPayment.preimage, commit = true))),
+                WrappedChannelCommand(channelId1, ChannelCommand.Htlc.Settlement.Fulfill(htlc1.id, incomingPayment.preimage, commit = true)),
+                WrappedChannelCommand(channelId2, ChannelCommand.Htlc.Settlement.Fulfill(htlc2.id, incomingPayment.preimage, commit = true)),
             )
             assertEquals(expected, result2.actions.toSet())
         }
@@ -1144,7 +983,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         run {
             val result = paymentHandler.process(htlc1, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Accepted }
-            val expected = WrappedChannelCommand(channelId1, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlc1.id, incomingPayment.preimage, commit = true)))
+            val expected = WrappedChannelCommand(channelId1, ChannelCommand.Htlc.Settlement.Fulfill(htlc1.id, incomingPayment.preimage, commit = true))
             assertEquals(setOf(expected), result.actions.toSet())
         }
     }
@@ -1171,8 +1010,8 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             assertTrue { result2 is IncomingPaymentHandler.ProcessAddResult.Accepted }
 
             val expected = setOf(
-                WrappedChannelCommand(channelId1, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlc1.id, incomingPayment.preimage, commit = true))),
-                WrappedChannelCommand(channelId2, ChannelCommand.ExecuteCommand(CMD_FULFILL_HTLC(htlc2.id, incomingPayment.preimage, commit = true))),
+                WrappedChannelCommand(channelId1, ChannelCommand.Htlc.Settlement.Fulfill(htlc1.id, incomingPayment.preimage, commit = true)),
+                WrappedChannelCommand(channelId2, ChannelCommand.Htlc.Settlement.Fulfill(htlc2.id, incomingPayment.preimage, commit = true)),
             )
             assertEquals(expected, result2.actions.toSet())
         }
@@ -1184,12 +1023,10 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
             val expected = WrappedChannelCommand(
-                channelId1, ChannelCommand.ExecuteCommand(
-                    CMD_FAIL_HTLC(
-                        3, CMD_FAIL_HTLC.Reason.Failure(
-                            IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())
-                        ), commit = true
-                    )
+                channelId1, ChannelCommand.Htlc.Settlement.Fail(
+                    3, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(
+                        IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())
+                    ), commit = true
                 )
             )
             assertEquals(setOf(expected), result.actions.toSet())
@@ -1202,12 +1039,10 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             val result = paymentHandler.process(add, TestConstants.defaultBlockHeight)
             assertTrue { result is IncomingPaymentHandler.ProcessAddResult.Rejected }
             val expected = WrappedChannelCommand(
-                channelId3, ChannelCommand.ExecuteCommand(
-                    CMD_FAIL_HTLC(
-                        htlc2.id, CMD_FAIL_HTLC.Reason.Failure(
-                            IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())
-                        ), commit = true
-                    )
+                channelId3, ChannelCommand.Htlc.Settlement.Fail(
+                    htlc2.id, ChannelCommand.Htlc.Settlement.Fail.Reason.Failure(
+                        IncorrectOrUnknownPaymentDetails(totalAmount, TestConstants.defaultBlockHeight.toLong())
+                    ), commit = true
                 )
             )
             assertEquals(setOf(expected), result.actions.toSet())
@@ -1216,32 +1051,41 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
 
     @Test
     fun `purge expired incoming payments`() = runSuspendTest {
-        val paymentHandler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, TestConstants.Bob.walletParams, InMemoryPaymentsDb())
+        val paymentHandler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, InMemoryPaymentsDb())
 
         // create incoming payment that has expired and not been paid
-        val expiredInvoice = paymentHandler.createInvoice(randomBytes32(), defaultAmount, Either.Left("expired"), listOf(), expirySeconds = 3600,
-            timestampSeconds = 1)
+        val expiredInvoice = paymentHandler.createInvoice(
+            randomBytes32(), defaultAmount, Either.Left("expired"), listOf(), expirySeconds = 3600,
+            timestampSeconds = 1
+        )
 
         // create incoming payment that has expired and been paid
-        delay(100)
-        val paidInvoice = paymentHandler.createInvoice(defaultPreimage, defaultAmount, Either.Left("paid"), listOf(), expirySeconds = 3600,
-            timestampSeconds = 100)
-        paymentHandler.db.receivePayment(paidInvoice.paymentHash, receivedWith = setOf(IncomingPayment.ReceivedWith.NewChannel(id = UUID.randomUUID(), amount = 15_000_000.msat, serviceFee = 1_000_000.msat, channelId = null)),
-            receivedAt = 101) // simulate incoming payment being paid before it expired
+        delay(100.milliseconds)
+        val paidInvoice = paymentHandler.createInvoice(
+            defaultPreimage, defaultAmount, Either.Left("paid"), listOf(), expirySeconds = 3600,
+            timestampSeconds = 100
+        )
+        paymentHandler.db.receivePayment(
+            paidInvoice.paymentHash,
+            receivedWith = listOf(IncomingPayment.ReceivedWith.NewChannel(amount = 15_000_000.msat, serviceFee = 1_000_000.msat, miningFee = 0.sat, channelId = randomBytes32(), txId = randomBytes32(), confirmedAt = null, lockedAt = null)),
+            receivedAt = 101
+        ) // simulate incoming payment being paid before it expired
 
         // create unexpired payment
-        delay(100)
+        delay(100.milliseconds)
         val unexpiredInvoice = paymentHandler.createInvoice(randomBytes32(), defaultAmount, Either.Left("unexpired"), listOf(), expirySeconds = 3600)
 
         val unexpiredPayment = paymentHandler.db.getIncomingPayment(unexpiredInvoice.paymentHash)!!
         val paidPayment = paymentHandler.db.getIncomingPayment(paidInvoice.paymentHash)!!
         val expiredPayment = paymentHandler.db.getIncomingPayment(expiredInvoice.paymentHash)!!
 
-        assertEquals(paymentHandler.db.listIncomingPayments(5, 0, setOf(PaymentTypeFilter.Normal)), listOf(unexpiredPayment, paidPayment, expiredPayment))
-        assertEquals(paymentHandler.db.listExpiredPayments(), listOf(expiredPayment))
+        val db = paymentHandler.db
+        assertIs<InMemoryPaymentsDb>(db)
+        assertEquals(db.listIncomingPayments(5, 0), listOf(unexpiredPayment, paidPayment, expiredPayment))
+        assertEquals(db.listExpiredPayments(), listOf(expiredPayment))
         assertEquals(paymentHandler.purgeExpiredPayments(), 1)
-        assertEquals(paymentHandler.db.listExpiredPayments(), emptyList())
-        assertEquals(paymentHandler.db.listIncomingPayments(5, 0, setOf(PaymentTypeFilter.Normal)), listOf(unexpiredPayment, paidPayment))
+        assertEquals(db.listExpiredPayments(), emptyList())
+        assertEquals(db.listIncomingPayments(5, 0), listOf(unexpiredPayment, paidPayment))
     }
 
     companion object {
@@ -1268,7 +1112,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             return listOf(channelHop)
         }
 
-        private fun makeCmdAddHtlc(destination: PublicKey, paymentHash: ByteVector32, finalPayload: PaymentOnion.FinalPayload): CMD_ADD_HTLC {
+        private fun makeCmdAddHtlc(destination: PublicKey, paymentHash: ByteVector32, finalPayload: PaymentOnion.FinalPayload): ChannelCommand.Htlc.Add {
             return OutgoingPaymentPacket.buildCommand(UUID.randomUUID(), paymentHash, channelHops(destination), finalPayload).first.copy(commit = true)
         }
 
@@ -1288,13 +1132,15 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             return PaymentOnion.FinalPayload.createMultiPartPayload(amount, totalAmount, expiry, paymentSecret, null)
         }
 
-        private fun makePayToOpenRequest(incomingPayment: IncomingPayment, finalPayload: PaymentOnion.FinalPayload, payToOpenMinAmount: MilliSatoshi = 10_000.msat): PayToOpenRequest {
+        const val payToOpenFeerate = 0.1
+
+        private fun makePayToOpenRequest(incomingPayment: IncomingPayment, finalPayload: PaymentOnion.FinalPayload): PayToOpenRequest {
             return PayToOpenRequest(
-                chainHash = ByteVector32.Zeroes,
+                chainHash = Block.RegtestGenesisBlock.hash,
                 fundingSatoshis = 100_000.sat,
                 amountMsat = finalPayload.amount,
-                payToOpenMinAmountMsat = payToOpenMinAmount,
-                payToOpenFeeSatoshis = finalPayload.amount.truncateToSatoshi() * 0.1, // 10%
+                payToOpenMinAmountMsat = 10_000.msat,
+                payToOpenFeeSatoshis = finalPayload.amount.truncateToSatoshi() * payToOpenFeerate, // 10%
                 paymentHash = incomingPayment.paymentHash,
                 expireAt = Long.MAX_VALUE,
                 finalPacket = OutgoingPaymentPacket.buildPacket(
@@ -1312,9 +1158,9 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
             return Pair(payee.db.getIncomingPayment(paymentRequest.paymentHash)!!, paymentRequest.paymentSecret)
         }
 
-        private fun makeReceivedWithNewChannel(payToOpen: PayToOpenRequest, uuid: UUID, feeRatio: Double = 0.1): IncomingPayment.ReceivedWith.NewChannel {
+        private fun makeReceivedWithNewChannel(payToOpen: PayToOpenRequest, feeRatio: Double = 0.1): IncomingPayment.ReceivedWith.NewChannel {
             val fee = payToOpen.amountMsat * feeRatio
-            return IncomingPayment.ReceivedWith.NewChannel(id = uuid, amount = payToOpen.amountMsat - fee, serviceFee = fee, channelId = null)
+            return IncomingPayment.ReceivedWith.NewChannel(amount = payToOpen.amountMsat - fee, serviceFee = fee, miningFee = 0.sat, channelId = randomBytes32(), txId = randomBytes32(), confirmedAt = null, lockedAt = null)
         }
 
         private suspend fun checkDbPayment(incomingPayment: IncomingPayment, db: IncomingPaymentsDb) {
@@ -1327,7 +1173,7 @@ class IncomingPaymentHandlerTestsCommon : LightningTestSuite() {
         }
 
         private suspend fun createFixture(invoiceAmount: MilliSatoshi?): Triple<IncomingPaymentHandler, IncomingPayment, ByteVector32> {
-            val paymentHandler = IncomingPaymentHandler(TestConstants.Bob.nodeParams.copy(minFundingSatoshis = 10.sat), TestConstants.Bob.walletParams, InMemoryPaymentsDb())
+            val paymentHandler = IncomingPaymentHandler(TestConstants.Bob.nodeParams, InMemoryPaymentsDb())
             val (incomingPayment, paymentSecret) = makeIncomingPayment(paymentHandler, invoiceAmount)
             return Triple(paymentHandler, incomingPayment, paymentSecret)
         }

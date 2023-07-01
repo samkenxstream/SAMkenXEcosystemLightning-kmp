@@ -6,9 +6,9 @@ import fr.acinq.lightning.MilliSatoshi
 import fr.acinq.lightning.ShortChannelId
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
 import fr.acinq.lightning.channel.Commitments
-import fr.acinq.lightning.channel.Normal
-import fr.acinq.lightning.channel.Offline
-import fr.acinq.lightning.channel.Syncing
+import fr.acinq.lightning.channel.states.Normal
+import fr.acinq.lightning.channel.states.Offline
+import fr.acinq.lightning.channel.states.Syncing
 import fr.acinq.lightning.channel.TestsHelper.reachNormal
 import fr.acinq.lightning.tests.utils.LightningTestSuite
 import fr.acinq.lightning.transactions.CommitmentSpec
@@ -27,10 +27,12 @@ class RouteCalculationTestsCommon : LightningTestSuite() {
 
     private fun makeChannel(channelId: ByteVector32, balance: MilliSatoshi, htlcMin: MilliSatoshi): Normal {
         val shortChannelId = ShortChannelId(Random.nextLong())
-        val reserve = defaultChannel.commitments.localChannelReserve
+        val reserve = defaultChannel.commitments.latest.localChannelReserve
         val commitments = defaultChannel.commitments.copy(
-            channelId = channelId,
-            remoteCommit = defaultChannel.commitments.remoteCommit.copy(spec = CommitmentSpec(setOf(), FeeratePerKw(0.sat), 50_000.msat, balance + ((Commitments.ANCHOR_AMOUNT * 2) + reserve).toMilliSatoshi()))
+            params = defaultChannel.commitments.params.copy(channelId = channelId),
+            active = defaultChannel.commitments.active.map {
+                it.copy(remoteCommit = it.remoteCommit.copy(spec = CommitmentSpec(setOf(), FeeratePerKw(0.sat), 50_000.msat, balance + ((Commitments.ANCHOR_AMOUNT * 2) + reserve).toMilliSatoshi())))
+            }
         )
         val channelUpdate = defaultChannel.state.channelUpdate.copy(htlcMinimumMsat = htlcMin)
         return defaultChannel.state.copy(shortChannelId = shortChannelId, commitments = commitments, channelUpdate = channelUpdate)
@@ -44,7 +46,7 @@ class RouteCalculationTestsCommon : LightningTestSuite() {
             channelId2 to Offline(makeChannel(channelId2, 20_000.msat, 5.msat)),
             channelId3 to Offline(makeChannel(channelId3, 10_000.msat, 10.msat)),
         )
-        assertEquals(setOf(10_000.msat, 15_000.msat, 20_000.msat), offlineChannels.map { it.value.state.commitments.availableBalanceForSend() }.toSet())
+        assertEquals(setOf(10_000.msat, 15_000.msat, 20_000.msat), offlineChannels.map { (it.value.state as Normal).commitments.availableBalanceForSend() }.toSet())
 
         val normalChannels = mapOf(
             channelId1 to makeChannel(channelId1, 15_000.msat, 10.msat),
@@ -59,7 +61,7 @@ class RouteCalculationTestsCommon : LightningTestSuite() {
         val (channelId1, channelId2, channelId3) = listOf(randomBytes32(), randomBytes32(), randomBytes32())
         val channels = mapOf(
             channelId1 to Offline(makeChannel(channelId1, 15_000.msat, 10.msat)),
-            channelId2 to Syncing(makeChannel(channelId2, 20_000.msat, 5.msat), false),
+            channelId2 to Syncing(makeChannel(channelId2, 20_000.msat, 5.msat), channelReestablishSent = true),
             channelId3 to Offline(makeChannel(channelId3, 10_000.msat, 10.msat)),
         )
         assertEquals(Either.Left(FinalFailure.NoAvailableChannels), routeCalculation.findRoutes(paymentId, 5_000.msat, channels))

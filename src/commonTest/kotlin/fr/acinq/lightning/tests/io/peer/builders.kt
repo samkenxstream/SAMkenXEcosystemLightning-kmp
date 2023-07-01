@@ -12,13 +12,16 @@ import fr.acinq.lightning.blockchain.fee.FeeratePerByte
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
 import fr.acinq.lightning.blockchain.fee.OnChainFeerates
 import fr.acinq.lightning.channel.*
+import fr.acinq.lightning.channel.states.ChannelStateWithCommitments
+import fr.acinq.lightning.channel.states.Normal
+import fr.acinq.lightning.channel.states.PersistedChannelState
+import fr.acinq.lightning.channel.states.Syncing
 import fr.acinq.lightning.db.InMemoryDatabases
 import fr.acinq.lightning.io.BytesReceived
 import fr.acinq.lightning.io.Peer
 import fr.acinq.lightning.io.TcpSocket
 import fr.acinq.lightning.utils.Connection
 import fr.acinq.lightning.utils.sat
-import fr.acinq.lightning.utils.toByteVector
 import fr.acinq.lightning.wire.ChannelReady
 import fr.acinq.lightning.wire.ChannelReestablish
 import fr.acinq.lightning.wire.Init
@@ -65,9 +68,9 @@ suspend fun newPeers(
     }
 
     // Initialize Bob with Alice's features
-    bob.send(BytesReceived(LightningMessage.encode(Init(features = nodeParams.first.features.initFeatures().toByteArray().toByteVector()))))
+    bob.send(BytesReceived(LightningMessage.encode(Init(features = nodeParams.first.features.initFeatures()))))
     // Initialize Alice with Bob's features
-    alice.send(BytesReceived(LightningMessage.encode(Init(features = nodeParams.second.features.initFeatures().toByteArray().toByteVector()))))
+    alice.send(BytesReceived(LightningMessage.encode(Init(features = nodeParams.second.features.initFeatures()))))
 
     // TODO update to depend on the initChannels size
     if (initChannels.isNotEmpty()) {
@@ -123,7 +126,7 @@ suspend fun CoroutineScope.newPeer(
 
     remotedNodeChannelState?.let { state ->
         // send Init from remote node
-        val theirInit = Init(features = state.ctx.staticParams.nodeParams.features.initFeatures().toByteArray().toByteVector())
+        val theirInit = Init(features = state.ctx.staticParams.nodeParams.features.initFeatures())
 
         val initMsg = LightningMessage.encode(theirInit)
         peer.send(BytesReceived(initMsg))
@@ -135,13 +138,12 @@ suspend fun CoroutineScope.newPeer(
         }
 
         val yourLastPerCommitmentSecret = state.commitments.remotePerCommitmentSecrets.lastIndex?.let { state.commitments.remotePerCommitmentSecrets.getHash(it) } ?: ByteVector32.Zeroes
-        val channelKeyPath = peer.nodeParams.keyManager.channelKeyPath(state.commitments.localParams, state.commitments.channelConfig)
-        val myCurrentPerCommitmentPoint = peer.nodeParams.keyManager.commitmentPoint(channelKeyPath, state.commitments.localCommit.index)
+        val myCurrentPerCommitmentPoint = peer.nodeParams.keyManager.channelKeys(state.commitments.params.localParams.fundingKeyPath).commitmentPoint(state.commitments.localCommitIndex)
 
         val channelReestablish = ChannelReestablish(
             channelId = state.channelId,
-            nextLocalCommitmentNumber = state.commitments.localCommit.index + 1,
-            nextRemoteRevocationNumber = state.commitments.remoteCommit.index,
+            nextLocalCommitmentNumber = state.commitments.localCommitIndex + 1,
+            nextRemoteRevocationNumber = state.commitments.remoteCommitIndex,
             yourLastCommitmentSecret = PrivateKey(yourLastPerCommitmentSecret),
             myCurrentPerCommitmentPoint = myCurrentPerCommitmentPoint
         ).withChannelData(state.commitments.remoteChannelData)
@@ -166,11 +168,12 @@ fun buildPeer(
     currentTip: Pair<Int, BlockHeader> = 0 to Block.RegtestGenesisBlock.header
 ): Peer {
     val electrum = ElectrumClient(TcpSocket.Builder(), scope, LoggerFactory.default)
-    val watcher = ElectrumWatcher(electrum.Caller(), scope, LoggerFactory.default)
+    val watcher = ElectrumWatcher(electrum, scope, LoggerFactory.default)
     val peer = Peer(nodeParams, walletParams, watcher, databases, TcpSocket.Builder(), scope)
     peer.currentTipFlow.value = currentTip
     peer.onChainFeeratesFlow.value = OnChainFeerates(
-        mutualCloseFeerate = FeeratePerKw(FeeratePerByte(20.sat)),
+        fundingFeerate = FeeratePerKw(FeeratePerByte(5.sat)),
+        mutualCloseFeerate = FeeratePerKw(FeeratePerByte(10.sat)),
         claimMainFeerate = FeeratePerKw(FeeratePerByte(20.sat)),
         fastFeerate = FeeratePerKw(FeeratePerByte(50.sat))
     )

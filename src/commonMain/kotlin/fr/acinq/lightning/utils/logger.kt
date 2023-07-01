@@ -1,7 +1,7 @@
 package fr.acinq.lightning.utils
 
-import fr.acinq.lightning.channel.*
-import fr.acinq.lightning.db.OutgoingPayment
+import fr.acinq.lightning.channel.states.*
+import fr.acinq.lightning.db.LightningOutgoingPayment
 import fr.acinq.lightning.io.SendPayment
 import fr.acinq.lightning.payment.PaymentPart
 import fr.acinq.lightning.wire.HasChannelId
@@ -43,6 +43,8 @@ suspend fun <T> MDCLogger.withMDC(mdc: Map<String, Any>, f: suspend (MDCLogger) 
     return f(logger)
 }
 
+
+
 /**
  * Utility functions to build MDC for various objects without polluting main classes
  */
@@ -60,7 +62,7 @@ fun SendPayment.mdc(): Map<String, Any> = mapOf(
     "recipient" to recipient
 )
 
-fun OutgoingPayment.mdc(): Map<String, Any> = mapOf(
+fun LightningOutgoingPayment.mdc(): Map<String, Any> = mapOf(
     "paymentId" to id,
     "paymentHash" to paymentHash,
     "amount" to amount,
@@ -70,7 +72,7 @@ fun OutgoingPayment.mdc(): Map<String, Any> = mapOf(
 fun ChannelState.mdc(): Map<String, Any> {
     val state = this
     return buildMap {
-        state::class.simpleName?.let { put("state", it) }
+        put("state", state.stateName)
         when (state) {
             is WaitForOpenChannel -> put("temporaryChannelId", state.temporaryChannelId)
             is WaitForAcceptChannel -> put("temporaryChannelId", state.temporaryChannelId)
@@ -79,6 +81,10 @@ fun ChannelState.mdc(): Map<String, Any> {
             is ChannelStateWithCommitments -> put("channelId", state.channelId)
             is Offline -> put("channelId", state.state.channelId)
             is Syncing -> put("channelId", state.state.channelId)
+            else -> {}
+        }
+        when(state) {
+            is ChannelStateWithCommitments -> put("commitments", "active=${state.commitments.active.map { it.fundingTxIndex }} inactive=${state.commitments.inactive.map { it.fundingTxIndex }}")
             else -> {}
         }
     }

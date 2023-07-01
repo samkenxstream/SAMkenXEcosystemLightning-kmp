@@ -10,11 +10,12 @@ import fr.acinq.lightning.Lightning.randomKey
 import fr.acinq.lightning.NodeUri
 import fr.acinq.lightning.blockchain.BITCOIN_FUNDING_DEPTHOK
 import fr.acinq.lightning.blockchain.WatchEventConfirmed
+import fr.acinq.lightning.blockchain.electrum.balance
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
 import fr.acinq.lightning.channel.*
 import fr.acinq.lightning.channel.TestsHelper.createWallet
+import fr.acinq.lightning.channel.states.*
 import fr.acinq.lightning.db.InMemoryDatabases
-import fr.acinq.lightning.db.OutgoingPayment
 import fr.acinq.lightning.io.*
 import fr.acinq.lightning.payment.PaymentRequest
 import fr.acinq.lightning.router.Announcements
@@ -50,7 +51,7 @@ class PeerTest : LightningTestSuite() {
         randomKey().publicKey(),
         randomKey().publicKey(),
         0.toByte(),
-        TlvStream(listOf(ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve)))
+        TlvStream(ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve))
     )
 
     @Test
@@ -59,9 +60,9 @@ class PeerTest : LightningTestSuite() {
         val bob = buildPeer(this, TestConstants.Bob.nodeParams, TestConstants.Bob.walletParams)
 
         // start Init for Alice
-        alice.send(BytesReceived(LightningMessage.encode(Init(features = TestConstants.Bob.nodeParams.features.toByteArray().toByteVector()))))
+        alice.send(BytesReceived(LightningMessage.encode(Init(features = TestConstants.Bob.nodeParams.features))))
         // start Init for Bob
-        bob.send(BytesReceived(LightningMessage.encode(Init(features = TestConstants.Alice.nodeParams.features.toByteArray().toByteVector()))))
+        bob.send(BytesReceived(LightningMessage.encode(Init(features = TestConstants.Alice.nodeParams.features))))
 
         // Wait until the Peer is ready
         alice.expectStatus(Connection.ESTABLISHED)
@@ -140,10 +141,10 @@ class PeerTest : LightningTestSuite() {
         alice.forward(txSigsBob)
         val txSigsAlice = alice2bob.expect<TxSignatures>()
         bob.forward(txSigsAlice)
-        val (channelId, aliceState) = alice.expectState<WaitForFundingConfirmed> { fundingTx.signedTx != null }
+        val (channelId, aliceState) = alice.expectState<WaitForFundingConfirmed> { latestFundingTx.signedTx != null }
         assertEquals(channelId, txAddInput.channelId)
         bob.expectState<WaitForFundingConfirmed>()
-        val fundingTx = aliceState.fundingTx.signedTx
+        val fundingTx = aliceState.latestFundingTx.signedTx
         assertNotNull(fundingTx)
 
         alice.send(WatchReceived(WatchEventConfirmed(channelId, BITCOIN_FUNDING_DEPTHOK, 50, 0, fundingTx)))
@@ -220,30 +221,27 @@ class PeerTest : LightningTestSuite() {
 
         val requestId = randomBytes32()
         val walletBob = createWallet(nodeParams.second.keyManager, 260_000.sat).second
-        val internalRequestBob = RequestChannelOpen(requestId, walletBob, 100, maxFeeFloor = 3_000.sat)
+        val internalRequestBob = RequestChannelOpen(requestId, walletBob)
         bob.send(internalRequestBob)
         val request = bob2alice.expect<PleaseOpenChannel>()
         assertEquals(request.localFundingAmount, 260_000.sat)
 
-        val fundingFee = 100.sat
-        val serviceFee = (internalRequestBob.maxFee - fundingFee - 1.sat).toMilliSatoshi()
-        // total fee is below max acceptable
-        assertTrue(fundingFee + serviceFee.truncateToSatoshi() < internalRequestBob.maxFee)
+        val miningFee = 500.sat
+        val serviceFee = 1_000.sat.toMilliSatoshi()
         val walletAlice = createWallet(nodeParams.first.keyManager, 50_000.sat).second
         val openAlice = OpenChannel(40_000.sat, 0.msat, walletAlice, FeeratePerKw(3500.sat), FeeratePerKw(2500.sat), 0, ChannelType.SupportedChannelType.AnchorOutputsZeroReserve)
         alice.send(openAlice)
         val open = alice2bob.expect<OpenDualFundedChannel>().copy(
             tlvStream = TlvStream(
-                listOf(
-                    ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve),
-                    ChannelTlv.ChannelOriginTlv(ChannelOrigin.PleaseOpenChannelOrigin(requestId, serviceFee, fundingFee))
-                )
+                ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve),
+                ChannelTlv.OriginTlv(Origin.PleaseOpenChannelOrigin(requestId, serviceFee, miningFee, openAlice.pushAmount))
             )
         )
         bob.forward(open)
         val accept = bob2alice.expect<AcceptDualFundedChannel>()
         assertEquals(open.temporaryChannelId, accept.temporaryChannelId)
-        assertEquals(accept.pushAmount, serviceFee)
+        val fundingFee = walletBob.balance - accept.fundingAmount
+        assertEquals(accept.pushAmount, serviceFee + miningFee.toMilliSatoshi() - fundingFee.toMilliSatoshi())
         alice.forward(accept)
 
         val txAddInputAlice = alice2bob.expect<TxAddInput>()
@@ -265,12 +263,12 @@ class PeerTest : LightningTestSuite() {
         val txSigsBob = bob2alice.expect<TxSignatures>()
         alice.forward(txSigsBob)
         val (_, aliceState) = alice.expectState<WaitForFundingConfirmed>()
-        assertEquals(aliceState.commitments.localCommit.spec.toLocal, openAlice.fundingAmount.toMilliSatoshi() + serviceFee)
+        assertEquals(aliceState.commitments.latest.localCommit.spec.toLocal, openAlice.fundingAmount.toMilliSatoshi() + serviceFee + miningFee.toMilliSatoshi() - fundingFee.toMilliSatoshi())
         val (_, bobState) = bob.expectState<WaitForFundingConfirmed>()
         // Bob has to deduce from its balance:
         //  - the fees for the channel open (10 000 sat)
         //  - the miner fees for his input(s) in the funding transaction
-        assertEquals(bobState.commitments.localCommit.spec.toLocal, walletBob.confirmedBalance.toMilliSatoshi() - serviceFee - fundingFee.toMilliSatoshi())
+        assertEquals(bobState.commitments.latest.localCommit.spec.toLocal, walletBob.balance.toMilliSatoshi() - serviceFee - miningFee.toMilliSatoshi())
     }
 
     @Test
@@ -281,22 +279,19 @@ class PeerTest : LightningTestSuite() {
 
         val requestId = randomBytes32()
         val walletBob = createWallet(nodeParams.second.keyManager, 260_000.sat).second
-        val internalRequestBob = RequestChannelOpen(requestId, walletBob, 100, maxFeeFloor = 3_000.sat)
+        val internalRequestBob = RequestChannelOpen(requestId, walletBob)
         bob.send(internalRequestBob)
         val request = bob2alice.expect<PleaseOpenChannel>()
         assertEquals(request.localFundingAmount, 260_000.sat)
         val fundingFee = 100.sat
-        val serviceFee = (internalRequestBob.maxFee - fundingFee + 1.sat).toMilliSatoshi()
-        assertTrue(fundingFee + serviceFee.truncateToSatoshi() > internalRequestBob.maxFee)
+        val serviceFee = request.localFundingAmount.toMilliSatoshi() * 0.02 // 2% fee is too high
         val walletAlice = createWallet(nodeParams.first.keyManager, 50_000.sat).second
         val openAlice = OpenChannel(40_000.sat, 0.msat, walletAlice, FeeratePerKw(3500.sat), FeeratePerKw(2500.sat), 0, ChannelType.SupportedChannelType.AnchorOutputsZeroReserve)
         alice.send(openAlice)
         val open = alice2bob.expect<OpenDualFundedChannel>().copy(
             tlvStream = TlvStream(
-                listOf(
-                    ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve),
-                    ChannelTlv.ChannelOriginTlv(ChannelOrigin.PleaseOpenChannelOrigin(requestId, serviceFee, fundingFee))
-                )
+                ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve),
+                ChannelTlv.OriginTlv(Origin.PleaseOpenChannelOrigin(requestId, serviceFee, fundingFee, openAlice.pushAmount))
             )
         )
         bob.forward(open)
@@ -315,10 +310,8 @@ class PeerTest : LightningTestSuite() {
         alice.send(openAlice)
         val open = alice2bob.expect<OpenDualFundedChannel>().copy(
             tlvStream = TlvStream(
-                listOf(
-                    ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve),
-                    ChannelTlv.ChannelOriginTlv(ChannelOrigin.PleaseOpenChannelOrigin(requestId, 50.sat.toMilliSatoshi(), 100.sat))
-                )
+                ChannelTlv.ChannelTypeTlv(ChannelType.SupportedChannelType.AnchorOutputsZeroReserve),
+                ChannelTlv.OriginTlv(Origin.PleaseOpenChannelOrigin(requestId, 50.sat.toMilliSatoshi(), 100.sat, openAlice.pushAmount))
             )
         )
         bob.forward(open)
@@ -347,7 +340,7 @@ class PeerTest : LightningTestSuite() {
         assertIs<Offline>(initChannels.values.first())
 
         // send Init from remote node
-        val theirInit = Init(features = bob0.staticParams.nodeParams.features.toByteArray().toByteVector())
+        val theirInit = Init(features = bob0.staticParams.nodeParams.features)
         val initMsg = LightningMessage.encode(theirInit)
         peer.send(BytesReceived(initMsg))
         // Wait until the Peer is ready
@@ -360,17 +353,18 @@ class PeerTest : LightningTestSuite() {
         assertEquals(channelId, syncChannels.first().state.channelId)
 
         val syncState = syncChannels.first()
+        assertIs<Normal>(syncState.state)
+        val commitments = (syncState.state as Normal).commitments
         val yourLastPerCommitmentSecret = ByteVector32.Zeroes
-        val channelKeyPath = peer.nodeParams.keyManager.channelKeyPath(syncState.state.commitments.localParams, syncState.state.commitments.channelConfig)
-        val myCurrentPerCommitmentPoint = peer.nodeParams.keyManager.commitmentPoint(channelKeyPath, syncState.state.commitments.localCommit.index)
+        val myCurrentPerCommitmentPoint = peer.nodeParams.keyManager.channelKeys(commitments.params.localParams.fundingKeyPath).commitmentPoint(commitments.localCommitIndex)
 
         val channelReestablish = ChannelReestablish(
             channelId = syncState.state.channelId,
-            nextLocalCommitmentNumber = syncState.state.commitments.localCommit.index + 1,
-            nextRemoteRevocationNumber = syncState.state.commitments.remoteCommit.index,
+            nextLocalCommitmentNumber = commitments.localCommitIndex + 1,
+            nextRemoteRevocationNumber = commitments.remoteCommitIndex,
             yourLastCommitmentSecret = PrivateKey(yourLastPerCommitmentSecret),
             myCurrentPerCommitmentPoint = myCurrentPerCommitmentPoint
-        ).withChannelData(syncState.state.commitments.remoteChannelData)
+        ).withChannelData(commitments.remoteChannelData)
 
         val reestablishMsg = LightningMessage.encode(channelReestablish)
         peer.send(BytesReceived(reestablishMsg))
@@ -388,6 +382,74 @@ class PeerTest : LightningTestSuite() {
     fun `restore channel -- bundled`() = runSuspendTest {
         val (alice0, bob0) = TestsHelper.reachNormal()
         newPeers(this, Pair(alice0.staticParams.nodeParams, bob0.staticParams.nodeParams), Pair(TestConstants.Alice.walletParams, TestConstants.Bob.walletParams), listOf(alice0 to bob0))
+    }
+
+    @Test
+    fun `restore channel -- unknown channel`() = runSuspendTest {
+        val (alice, _, alice2bob) = newPeers(this, Pair(TestConstants.Alice.nodeParams, TestConstants.Bob.nodeParams), Pair(TestConstants.Alice.walletParams, TestConstants.Bob.walletParams))
+        val unknownChannelReestablish = ChannelReestablish(randomBytes32(), 1, 0, randomKey(), randomKey().publicKey())
+        alice.send(BytesReceived(LightningMessage.encode(unknownChannelReestablish)))
+        alice2bob.expect<Error>()
+    }
+
+    @Test
+    fun `recover channel`() = runSuspendTest {
+        val (alice0, bob0) = TestsHelper.reachNormal()
+        val (nodes, _, htlc) = TestsHelper.addHtlc(50_000_000.msat, bob0, alice0)
+        val (bob1, alice1) = TestsHelper.crossSign(nodes.first, nodes.second)
+
+        val peer = buildPeer(
+            this,
+            bob0.staticParams.nodeParams.copy(checkHtlcTimeoutAfterStartupDelaySeconds = 5),
+            TestConstants.Bob.walletParams,
+            databases = InMemoryDatabases(), // NB: empty database (Bob has lost its channel state)
+            currentTip = htlc.cltvExpiry.toLong().toInt() to Block.RegtestGenesisBlock.header
+        )
+
+        // Simulate a reconnection with Alice.
+        peer.send(BytesReceived(LightningMessage.encode(Init(features = alice0.staticParams.nodeParams.features))))
+        peer.expectStatus(Connection.ESTABLISHED)
+        val aliceReestablish = alice1.state.run { alice1.ctx.createChannelReestablish() }
+        assertFalse(aliceReestablish.channelData.isEmpty())
+        peer.send(BytesReceived(LightningMessage.encode(aliceReestablish)))
+
+        // Wait until the channels are Syncing
+        val restoredChannel = peer.channelsFlow
+            .first { it.size == 1 }
+            .values
+            .first()
+        assertEquals(bob1.state, restoredChannel)
+        assertEquals(peer.db.channels.listLocalChannels(), listOf(restoredChannel))
+    }
+
+    @Test
+    fun `recover channel -- outdated local data`() = runSuspendTest {
+        val (alice0, bob0) = TestsHelper.reachNormal()
+        val (nodes, _, htlc) = TestsHelper.addHtlc(50_000_000.msat, bob0, alice0)
+        val (bob1, alice1) = TestsHelper.crossSign(nodes.first, nodes.second)
+
+        val peer = buildPeer(
+            this,
+            bob0.staticParams.nodeParams.copy(checkHtlcTimeoutAfterStartupDelaySeconds = 5),
+            TestConstants.Bob.walletParams,
+            databases = InMemoryDatabases().also { it.channels.addOrUpdateChannel(bob0.state) }, // NB: outdated channel data
+            currentTip = htlc.cltvExpiry.toLong().toInt() to Block.RegtestGenesisBlock.header
+        )
+
+        // Simulate a reconnection with Alice.
+        peer.send(BytesReceived(LightningMessage.encode(Init(features = alice0.staticParams.nodeParams.features))))
+        peer.expectStatus(Connection.ESTABLISHED)
+        val aliceReestablish = alice1.state.run { alice1.ctx.createChannelReestablish() }
+        assertFalse(aliceReestablish.channelData.isEmpty())
+        peer.send(BytesReceived(LightningMessage.encode(aliceReestablish)))
+
+        // Wait until the channels are Syncing
+        val restoredChannel = peer.channelsFlow
+            .first { it.size == 1 && it.values.first() is Normal }
+            .values
+            .first()
+        assertEquals(bob1.state, restoredChannel)
+        assertEquals(peer.db.channels.listLocalChannels(), listOf(restoredChannel))
     }
 
     @Test
@@ -457,7 +519,7 @@ class PeerTest : LightningTestSuite() {
         bob.send(ReceivePayment(randomBytes32(), 15_000_000.msat, Either.Left("test invoice"), null, deferredInvoice))
         val invoice = deferredInvoice.await()
 
-        alice.send(SendPaymentNormal(UUID.randomUUID(), invoice.amount!!, alice.remoteNodeId, OutgoingPayment.Details.Normal(invoice)))
+        alice.send(SendPayment(UUID.randomUUID(), invoice.amount!!, alice.remoteNodeId, invoice))
 
         val updateHtlc = alice2bob.expect<UpdateAddHtlc>()
         val aliceCommitSig = alice2bob.expect<CommitSig>()
@@ -503,7 +565,7 @@ class PeerTest : LightningTestSuite() {
         bob.send(ReceivePayment(randomBytes32(), 15_000_000.msat, Either.Left("test invoice"), null, deferredInvoice))
         val invoice = deferredInvoice.await()
 
-        alice.send(SendPaymentNormal(UUID.randomUUID(), invoice.amount!!, alice.remoteNodeId, OutgoingPayment.Details.Normal(invoice)))
+        alice.send(SendPayment(UUID.randomUUID(), invoice.amount!!, alice.remoteNodeId, invoice))
 
         alice.expectState<Normal> { commitments.availableBalanceForReceive() > alice0.commitments.availableBalanceForReceive() }
     }

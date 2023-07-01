@@ -3,9 +3,8 @@ package fr.acinq.lightning.serialization
 import fr.acinq.bitcoin.ByteVector32
 import fr.acinq.bitcoin.Crypto
 import fr.acinq.bitcoin.PrivateKey
-import fr.acinq.lightning.channel.PersistedChannelState
+import fr.acinq.lightning.channel.states.PersistedChannelState
 import fr.acinq.lightning.crypto.ChaCha20Poly1305
-import fr.acinq.lightning.utils.runTrying
 import fr.acinq.lightning.utils.toByteVector
 import fr.acinq.lightning.wire.EncryptedChannelData
 
@@ -27,8 +26,7 @@ object Encryption {
         val ciphertext = data.dropLast(12 + 16)
         val nonce = data.takeLast(12 + 16).take(12)
         val tag = data.takeLast(16)
-        val plaintext = ChaCha20Poly1305.decrypt(key.toByteArray(), nonce.toByteArray(), ciphertext.toByteArray(), ByteArray(0), tag.toByteArray())
-        return plaintext
+        return ChaCha20Poly1305.decrypt(key.toByteArray(), nonce.toByteArray(), ciphertext.toByteArray(), ByteArray(0), tag.toByteArray())
     }
 
     /**
@@ -45,13 +43,11 @@ object Encryption {
     /**
      * Convenience method that decrypts and deserializes a [PersistedChannelState] from an [EncryptedChannelData]
      */
-    fun PersistedChannelState.Companion.from(key: PrivateKey, encryptedChannelData: EncryptedChannelData): PersistedChannelState {
+    fun PersistedChannelState.Companion.from(key: PrivateKey, encryptedChannelData: EncryptedChannelData): Result<Serialization.DeserializationResult> {
         // we first assume that channel data is prefixed by 2 bytes of serialization meta-info
-        val decrypted = runTrying { decrypt(key.value, encryptedChannelData.data.drop(2).toByteArray()) }
-            .recoverWith { runTrying { decrypt(key.value, encryptedChannelData.data.toByteArray()) } }
-            .get()
-        val state = Serialization.deserialize(decrypted)
-        return state
+        return runCatching { decrypt(key.value, encryptedChannelData.data.drop(2).toByteArray()) }
+            .recoverCatching { decrypt(key.value, encryptedChannelData.data.toByteArray()) }
+            .map { Serialization.deserialize(it) }
     }
 
 }

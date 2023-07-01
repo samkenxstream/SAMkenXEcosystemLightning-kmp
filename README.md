@@ -1,4 +1,4 @@
-[![Kotlin](https://img.shields.io/badge/Kotlin-1.6.21-blue.svg?style=flat&logo=kotlin)](http://kotlinlang.org)
+[![Kotlin](https://img.shields.io/badge/Kotlin-1.8.21-blue.svg?style=flat&logo=kotlin)](http://kotlinlang.org)
 [![Maven Central](https://img.shields.io/maven-central/v/fr.acinq.lightning/lightning-kmp)](https://search.maven.org/search?q=g:fr.acinq.lightning%20a:lightning-kmp*)
 ![Github Actions](https://github.com/ACINQ/lightning-kmp/actions/workflows/test.yml/badge.svg)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
@@ -15,6 +15,10 @@ Read [this article](https://medium.com/@ACINQ/when-ios-cdf798d5f8ef) for more de
 ## Installation
 
 See instructions [here](https://github.com/ACINQ/lightning-kmp/blob/master/BUILD.md) to build and test the library.
+
+## Recovering on-chain funds
+
+See instructions [here](./RECOVERY.md) to recover on-chain funds.
 
 ## Contributing
 

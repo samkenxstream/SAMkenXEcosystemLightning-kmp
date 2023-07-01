@@ -5,12 +5,14 @@
     // If we used @Serializable annotations directly on the actual classes, Kotlin would be
     // able to resolve serializers by itself. It is verbose, but it allows us to contain
     // serialization code in this file.
+    JsonSerializers.CommitmentSerializer::class,
     JsonSerializers.CommitmentsSerializer::class,
     JsonSerializers.ClosingFeeratesSerializer::class,
     JsonSerializers.LocalParamsSerializer::class,
     JsonSerializers.RemoteParamsSerializer::class,
     JsonSerializers.LocalCommitSerializer::class,
     JsonSerializers.RemoteCommitSerializer::class,
+    JsonSerializers.NextRemoteCommitSerializer::class,
     JsonSerializers.LocalChangesSerializer::class,
     JsonSerializers.RemoteChangesSerializer::class,
     JsonSerializers.EitherSerializer::class,
@@ -36,6 +38,7 @@
     JsonSerializers.ChannelKeysSerializer::class,
     JsonSerializers.TransactionSerializer::class,
     JsonSerializers.OutPointSerializer::class,
+    JsonSerializers.TxOutSerializer::class,
     JsonSerializers.ClosingTxProposedSerializer::class,
     JsonSerializers.LocalCommitPublishedSerializer::class,
     JsonSerializers.RemoteCommitPublishedSerializer::class,
@@ -50,9 +53,17 @@
     JsonSerializers.ChannelUpdateSerializer::class,
     JsonSerializers.ChannelAnnouncementSerializer::class,
     JsonSerializers.WaitingForRevocationSerializer::class,
+    JsonSerializers.SharedFundingInputSerializer::class,
     JsonSerializers.InteractiveTxParamsSerializer::class,
     JsonSerializers.SignedSharedTransactionSerializer::class,
+    JsonSerializers.InteractiveTxSigningSessionSerializer::class,
     JsonSerializers.RbfStatusSerializer::class,
+    JsonSerializers.SpliceStatusSerializer::class,
+    JsonSerializers.ChannelParamsSerializer::class,
+    JsonSerializers.ChannelOriginSerializer::class,
+    JsonSerializers.CommitmentChangesSerializer::class,
+    JsonSerializers.LocalFundingStatusSerializer::class,
+    JsonSerializers.RemoteFundingStatusSerializer::class,
     JsonSerializers.EncryptedChannelDataSerializer::class,
     JsonSerializers.ShutdownSerializer::class,
     JsonSerializers.ClosingSignedSerializer::class,
@@ -76,7 +87,7 @@
     JsonSerializers.ClosingSerializer::class,
 )
 @file:UseContextualSerialization(
-    ChannelStateWithCommitments::class
+    PersistedChannelState::class
 )
 
 package fr.acinq.lightning.json
@@ -85,6 +96,8 @@ import fr.acinq.bitcoin.*
 import fr.acinq.lightning.*
 import fr.acinq.lightning.blockchain.fee.FeeratePerKw
 import fr.acinq.lightning.channel.*
+import fr.acinq.lightning.channel.states.*
+import fr.acinq.lightning.crypto.KeyManager
 import fr.acinq.lightning.crypto.ShaChain
 import fr.acinq.lightning.json.JsonSerializers.LongSerializer
 import fr.acinq.lightning.json.JsonSerializers.StringSerializer
@@ -124,7 +137,7 @@ object JsonSerializers {
         prettyPrint = true
         serializersModule = SerializersModule {
             // we need to explicitly define a [PolymorphicSerializer] for sealed classes, but not for interfaces
-            fun PolymorphicModuleBuilder<PersistedChannelState>.registerSubclasses() {
+            fun PolymorphicModuleBuilder<ChannelStateWithCommitments>.registerChannelStateWithCommitmentsSubclasses() {
                 subclass(LegacyWaitForFundingConfirmed::class, LegacyWaitForFundingConfirmedSerializer)
                 subclass(LegacyWaitForFundingLocked::class, LegacyWaitForFundingLockedSerializer)
                 subclass(WaitForFundingConfirmed::class, WaitForFundingConfirmedSerializer)
@@ -136,23 +149,30 @@ object JsonSerializers {
                 subclass(WaitForRemotePublishFutureCommitment::class, WaitForRemotePublishFutureCommitmentSerializer)
                 subclass(Closed::class, ClosedSerializer)
             }
+
+            fun PolymorphicModuleBuilder<PersistedChannelState>.registerPersistedChannelStateSubclasses() {
+                registerChannelStateWithCommitmentsSubclasses()
+                subclass(WaitForFundingSigned::class, WaitForFundingSignedSerializer)
+            }
+
             contextual(PolymorphicSerializer(ChannelState::class))
             polymorphicDefaultSerializer(ChannelState::class) { ChannelStateSerializer }
             polymorphic(ChannelState::class) {
-                registerSubclasses()
+                registerPersistedChannelStateSubclasses()
                 subclass(Offline::class, OfflineSerializer)
                 subclass(Syncing::class, SyncingSerializer)
+            }
+
+            contextual(PolymorphicSerializer(PersistedChannelState::class))
+            polymorphicDefaultSerializer(PersistedChannelState::class) { ChannelStateSerializer }
+            polymorphic(PersistedChannelState::class) {
+                registerPersistedChannelStateSubclasses()
             }
 
             contextual(PolymorphicSerializer(ChannelStateWithCommitments::class))
             polymorphicDefaultSerializer(ChannelStateWithCommitments::class) { ChannelStateSerializer }
             polymorphic(ChannelStateWithCommitments::class) {
-                registerSubclasses()
-            }
-
-            contextual(PolymorphicSerializer(PersistedChannelState::class))
-            polymorphic(PersistedChannelState::class) {
-                registerSubclasses()
+                registerChannelStateWithCommitmentsSubclasses()
             }
 
             polymorphic(UpdateMessage::class) {
@@ -198,6 +218,9 @@ object JsonSerializers {
     @Serializer(forClass = LegacyWaitForFundingLocked::class)
     object LegacyWaitForFundingLockedSerializer
 
+    @Serializer(forClass = WaitForFundingSigned::class)
+    object WaitForFundingSignedSerializer
+
     @Serializer(forClass = WaitForFundingConfirmed::class)
     object WaitForFundingConfirmedSerializer
 
@@ -222,14 +245,70 @@ object JsonSerializers {
     @Serializer(forClass = Closed::class)
     object ClosedSerializer
 
+    @Serializable
+    data class SharedFundingInputSurrogate(val outPoint: OutPoint, val amount: Satoshi)
+    object SharedFundingInputSerializer : SurrogateSerializer<SharedFundingInput, SharedFundingInputSurrogate>(
+        transform = { i ->
+            when (i) {
+                is SharedFundingInput.Multisig2of2 -> SharedFundingInputSurrogate(i.info.outPoint, i.info.txOut.amount)
+            }
+        },
+        delegateSerializer = SharedFundingInputSurrogate.serializer()
+    )
+
     @Serializer(forClass = InteractiveTxParams::class)
     object InteractiveTxParamsSerializer
 
     @Serializer(forClass = SignedSharedTransaction::class)
     object SignedSharedTransactionSerializer
 
-    @Serializer(forClass = WaitForFundingConfirmed.Companion.RbfStatus::class)
+    @Serializable
+    data class InteractiveTxSigningSessionSurrogate(val fundingParams: InteractiveTxParams, val fundingTxId: ByteVector32)
+    object InteractiveTxSigningSessionSerializer : SurrogateSerializer<InteractiveTxSigningSession, InteractiveTxSigningSessionSurrogate>(
+        transform = { s -> InteractiveTxSigningSessionSurrogate(s.fundingParams, s.fundingTx.txId) },
+        delegateSerializer = InteractiveTxSigningSessionSurrogate.serializer()
+    )
+
+    @Serializer(forClass = RbfStatus::class)
     object RbfStatusSerializer
+
+    object SpliceStatusSerializer : StringSerializer<SpliceStatus>({ it::class.simpleName!! })
+
+    @Serializer(forClass = ChannelParams::class)
+    object ChannelParamsSerializer
+
+    @Serializer(forClass = Origin::class)
+    object ChannelOriginSerializer
+
+    @Serializer(forClass = CommitmentChanges::class)
+    object CommitmentChangesSerializer
+
+    @Serializable
+    data class LocalFundingStatusSurrogate(val status: String, val txId: ByteVector32)
+    object LocalFundingStatusSerializer : SurrogateSerializer<LocalFundingStatus, LocalFundingStatusSurrogate>(
+        transform = { o ->
+            when (o) {
+                is LocalFundingStatus.UnconfirmedFundingTx -> LocalFundingStatusSurrogate("unconfirmed", o.txId)
+                is LocalFundingStatus.ConfirmedFundingTx -> LocalFundingStatusSurrogate("confirmed", o.txId)
+            }
+        },
+        delegateSerializer = LocalFundingStatusSurrogate.serializer()
+    )
+
+    @Serializable
+    data class RemoteFundingStatusSurrogate(val status: String)
+    object RemoteFundingStatusSerializer : SurrogateSerializer<RemoteFundingStatus, RemoteFundingStatusSurrogate>(
+        transform = { o ->
+            when (o) {
+                RemoteFundingStatus.NotLocked -> RemoteFundingStatusSurrogate("not-locked")
+                RemoteFundingStatus.Locked -> RemoteFundingStatusSurrogate("locked")
+            }
+        },
+        delegateSerializer = RemoteFundingStatusSurrogate.serializer()
+    )
+
+    @Serializer(forClass = Commitment::class)
+    object CommitmentSerializer
 
     @Serializer(forClass = Commitments::class)
     object CommitmentsSerializer
@@ -248,6 +327,9 @@ object JsonSerializers {
 
     @Serializer(forClass = RemoteCommit::class)
     object RemoteCommitSerializer
+
+    @Serializer(forClass = NextRemoteCommit::class)
+    object NextRemoteCommitSerializer
 
     @Serializer(forClass = LocalChanges::class)
     object LocalChangesSerializer
@@ -330,7 +412,7 @@ object JsonSerializers {
     object CltvExpiryDeltaSerializer : LongSerializer<CltvExpiryDelta>({ it.toLong() })
     object FeeratePerKwSerializer : LongSerializer<FeeratePerKw>({ it.toLong() })
 
-    object ChannelKeysSerializer : SurrogateSerializer<ChannelKeys, KeyPath>(
+    object ChannelKeysSerializer : SurrogateSerializer<KeyManager.ChannelKeys, KeyPath>(
         transform = { it.fundingKeyPath },
         delegateSerializer = KeyPathSerializer
     )
@@ -420,7 +502,7 @@ object JsonSerializers {
     object GenericTlvSerializer
 
     @Serializable
-    data class TlvStreamSurrogate(val records: List<Tlv>, val unknown: List<GenericTlv> = listOf())
+    data class TlvStreamSurrogate(val records: Set<Tlv>, val unknown: Set<GenericTlv> = setOf())
     class TlvStreamSerializer<T : Tlv> : KSerializer<TlvStream<T>> {
         private val delegateSerializer = TlvStreamSurrogate.serializer()
         override val descriptor: SerialDescriptor = delegateSerializer.descriptor

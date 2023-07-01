@@ -1,126 +1,168 @@
 package fr.acinq.lightning.crypto
 
 import fr.acinq.bitcoin.*
-import fr.acinq.bitcoin.Crypto.sha256
-import fr.acinq.bitcoin.DeterministicWallet.ExtendedPublicKey
-import fr.acinq.bitcoin.crypto.Pack
-import fr.acinq.lightning.channel.*
-import fr.acinq.lightning.transactions.Transactions.TransactionWithInputInfo
+import fr.acinq.bitcoin.DeterministicWallet.hardened
+import fr.acinq.bitcoin.io.ByteArrayInput
+import fr.acinq.lightning.NodeParams
+import fr.acinq.lightning.transactions.Scripts
+import fr.acinq.lightning.utils.toByteVector
+import fr.acinq.lightning.wire.LightningCodecs
 
 interface KeyManager {
-    /** The node key that the same seed would have produced on the legacy eclair-based Phoenix implementation on Android. Useful to automate the migration. */
-    val legacyNodeKey: DeterministicWallet.ExtendedPrivateKey
-    val nodeKey: DeterministicWallet.ExtendedPrivateKey
-    val nodeId: PublicKey
 
-    fun bip84PrivateKey(account: Long, addressIndex: Long): PrivateKey
-
-    fun bip84Address(account: Long, addressIndex: Long): String
-
-    fun closingPubkeyScript(fundingPubKey: PublicKey): Pair<PublicKey, ByteArray>
-
-    fun fundingPublicKey(keyPath: KeyPath): ExtendedPublicKey
-
-    fun revocationPoint(channelKeyPath: KeyPath): ExtendedPublicKey
-
-    fun paymentPoint(channelKeyPath: KeyPath): ExtendedPublicKey
-
-    fun delayedPaymentPoint(channelKeyPath: KeyPath): ExtendedPublicKey
-
-    fun htlcPoint(channelKeyPath: KeyPath): ExtendedPublicKey
-
-    fun commitmentSecret(channelKeyPath: KeyPath, index: Long): PrivateKey
-
-    fun commitmentPoint(channelKeyPath: KeyPath, index: Long): PublicKey
-
-    fun commitmentSecret(shaSeed: ByteVector32, index: Long): PrivateKey
-
-    fun commitmentPoint(shaSeed: ByteVector32, index: Long): PublicKey
-
-    fun channelKeyPath(fundingKeyPath: KeyPath, channelConfig: ChannelConfig): KeyPath = when {
-        // deterministic mode: use the funding pubkey to compute the channel key path
-        channelConfig.hasOption(ChannelConfigOption.FundingPubKeyBasedChannelKeyPath) -> channelKeyPath(fundingPublicKey(fundingKeyPath))
-        // legacy mode:  we reuse the funding key path as our channel key path
-        else -> fundingKeyPath
-    }
-
-    fun channelKeyPath(localParams: LocalParams, channelConfig: ChannelConfig): KeyPath = channelKeyPath(localParams.fundingKeyPath, channelConfig)
+    val nodeKeys: NodeKeys
 
     /**
-     *
+     * Picks a random funding key path for a new channel.
      * @param isInitiator true if we are the channel initiator
-     * @return a partial key path for a new funding public key. This key path will be extended:
-     *         - with a specific "chain" prefix
-     *         - with a specific "funding pubkey" suffix
      */
     fun newFundingKeyPath(isInitiator: Boolean): KeyPath
 
     /**
-     * generate channel-specific keys and secrets
+     * Generate channel-specific keys and secrets
      * @params fundingKeyPath funding public key BIP32 path
      * @return channel keys and secrets
      */
     fun channelKeys(fundingKeyPath: KeyPath): ChannelKeys
 
-    /**
-     * generate channel-specific keys and secrets (note that we cannot re-compute the channel's funding private key)
-     * @params fundingPubKey funding public key
-     * @return channel keys and secrets
-     */
-    fun recoverChannelKeys(fundingPubKey: PublicKey): RecoveredChannelKeys
+    val finalOnChainWallet: Bip84OnChainKeys
+
+    val swapInOnChainWallet: SwapInOnChainKeys
 
     /**
-     *
-     * @param tx        input transaction
-     * @param privateKey private key
-     * @return a signature generated with the input private key
+     * Keys used for the node. They are used to generate the node id, to secure communication with other peers, and
+     * to sign network-wide public announcements.
      */
-    fun sign(tx: TransactionWithInputInfo, privateKey: PrivateKey): ByteVector64
+    data class NodeKeys(
+        /** The node key that the same seed would have produced on the legacy eclair-based Phoenix implementation on Android. Useful to automate the migration. */
+        val legacyNodeKey: DeterministicWallet.ExtendedPrivateKey,
+        val nodeKey: DeterministicWallet.ExtendedPrivateKey,
+    )
 
     /**
-     * This method is used to spend funds send to htlc keys/delayed keys
-     *
-     * @param tx          input transaction
-     * @param privateKey  private key
-     * @param remotePoint remote point
-     * @return a signature generated with a private key generated from the input private key and the remote point.
+     * Secrets and keys for a given channel.
+     * How these keys are generated depends on the [KeyManager] implementation.
      */
-    fun sign(tx: TransactionWithInputInfo, privateKey: PrivateKey, remotePoint: PublicKey, sigHash: Int): ByteVector64
+    data class ChannelKeys(
+        val fundingKeyPath: KeyPath,
+        val fundingKey: (Long) -> PrivateKey,
+        val paymentKey: PrivateKey,
+        val delayedPaymentKey: PrivateKey,
+        val htlcKey: PrivateKey,
+        val revocationKey: PrivateKey,
+        val shaSeed: ByteVector32,
+    ) {
+        fun fundingPubKey(index: Long): PublicKey = fundingKey(index).publicKey()
+        val htlcBasepoint: PublicKey = htlcKey.publicKey()
+        val paymentBasepoint: PublicKey = paymentKey.publicKey()
+        val delayedPaymentBasepoint: PublicKey = delayedPaymentKey.publicKey()
+        val revocationBasepoint: PublicKey = revocationKey.publicKey()
+        val temporaryChannelId: ByteVector32 = (ByteVector(ByteArray(33) { 0 }) + revocationBasepoint.value).sha256()
+        fun commitmentPoint(index: Long): PublicKey = Bolt3Derivation.perCommitPoint(shaSeed, index)
+        fun commitmentSecret(index: Long): PrivateKey = Bolt3Derivation.perCommitSecret(shaSeed, index)
+    }
 
-    /**
-     * Ths method is used to spend revoked transactions, with the corresponding revocation key
-     *
-     * @param tx           input transaction
-     * @param privateKey   private key
-     * @param remoteSecret remote secret
-     * @return a signature generated with a private key generated from the input private key and the remote secret.
-     */
-    fun sign(tx: TransactionWithInputInfo, privateKey: PrivateKey, remoteSecret: PrivateKey): ByteVector64
+    data class Bip84OnChainKeys(
+        private val chain: NodeParams.Chain,
+        private val master: DeterministicWallet.ExtendedPrivateKey,
+        val account: Long
+    ) {
+        private val xpriv = DeterministicWallet.derivePrivateKey(master, bip84BasePath(chain) / hardened(account))
 
-    companion object {
-        /**
-         * Create a BIP32 path from a public key. This path will be used to derive channel keys.
-         * Having channel keys derived from the funding public keys makes it very easy to retrieve your funds when've you've lost your data:
-         * - connect to your peer and use DLP to get them to publish their remote commit tx
-         * - retrieve the commit tx from the bitcoin network, extract your funding pubkey from its witness data
-         * - recompute your channel keys and spend your output
-         *
-         * @param fundingPubKey funding public key
-         * @return a BIP32 path
-         */
-        fun channelKeyPath(fundingPubKey: PublicKey): KeyPath {
-            val buffer = sha256(fundingPubKey.value)
-
-            val path = sequence {
-                var i = 0
-                while (true) {
-                    yield(Pack.int32BE(buffer, i).toUInt().toLong())
-                    i += 4
-                }
+        val xpub: String = DeterministicWallet.encode(
+            input = DeterministicWallet.publicKey(xpriv),
+            prefix = when (chain) {
+                NodeParams.Chain.Testnet, NodeParams.Chain.Regtest -> DeterministicWallet.vpub
+                NodeParams.Chain.Mainnet -> DeterministicWallet.zpub
             }
-            return KeyPath(path.take(8).toList())
+        )
+
+        fun privateKey(addressIndex: Long): PrivateKey {
+            return DeterministicWallet.derivePrivateKey(xpriv, KeyPath.empty / 0 / addressIndex).privateKey
         }
 
-        fun channelKeyPath(fundingPubKey: ExtendedPublicKey): KeyPath = channelKeyPath(fundingPubKey.publicKey)
+        fun pubkeyScript(addressIndex: Long): ByteVector {
+            val priv = privateKey(addressIndex)
+            val pub = priv.publicKey()
+            val script = Script.pay2wpkh(pub)
+            return Script.write(script).toByteVector()
+        }
+
+        fun address(addressIndex: Long): String {
+            return Bitcoin.computeP2WpkhAddress(privateKey(addressIndex).publicKey(), chain.chainHash)
+        }
+
+        companion object {
+            fun bip84BasePath(chain: NodeParams.Chain) = when (chain) {
+                NodeParams.Chain.Regtest, NodeParams.Chain.Testnet -> KeyPath.empty / hardened(84) / hardened(1)
+                NodeParams.Chain.Mainnet -> KeyPath.empty / hardened(84) / hardened(0)
+            }
+        }
     }
+
+    /**
+     * We use a specific kind of swap-in where users send funds to a 2-of-2 multisig with a timelock refund.
+     * Once confirmed, the swap-in utxos can be spent by one of two paths:
+     *  - with a signature from both [userPublicKey] and [remoteServerPublicKey]
+     *  - with a signature from [userPublicKey] after the [refundDelay]
+     * The keys used are static across swaps to make recovery easier.
+     */
+    data class SwapInOnChainKeys(
+        private val chain: NodeParams.Chain,
+        private val master: DeterministicWallet.ExtendedPrivateKey,
+        val remoteServerPublicKey: PublicKey,
+        val refundDelay: Int = SwapInRefundDelay
+    ) {
+        private val userExtendedPrivateKey: DeterministicWallet.ExtendedPrivateKey = DeterministicWallet.derivePrivateKey(master, swapInUserKeyPath(chain))
+        val userPrivateKey: PrivateKey = userExtendedPrivateKey.privateKey
+        val userPublicKey: PublicKey = userPrivateKey.publicKey()
+
+        private val localServerExtendedPrivateKey: DeterministicWallet.ExtendedPrivateKey = DeterministicWallet.derivePrivateKey(master, swapInLocalServerKeyPath(chain))
+        fun localServerPrivateKey(remoteNodeId: PublicKey): PrivateKey = DeterministicWallet.derivePrivateKey(localServerExtendedPrivateKey, perUserPath(remoteNodeId)).privateKey
+
+        val redeemScript: List<ScriptElt> = Scripts.swapIn2of2(userPublicKey, remoteServerPublicKey, refundDelay)
+        val pubkeyScript: List<ScriptElt> = Script.pay2wsh(redeemScript)
+        val address: String = Bitcoin.addressFromPublicKeyScript(chain.chainHash, pubkeyScript)!!
+
+        /**
+         * The output script descriptor matching our swap-in addresses.
+         * That descriptor can be imported in bitcoind to recover funds after the refund delay.
+         */
+        val descriptor = run {
+            // Since child public keys cannot be derived from a master xpub when hardened derivation is used,
+            // we need to provide the fingerprint of the master xpub and the hardened derivation path.
+            // This lets wallets that have access to the master xpriv derive the corresponding private and public keys.
+            val masterFingerprint = ByteVector(Crypto.hash160(DeterministicWallet.publicKey(master).publickeybytes).take(4).toByteArray())
+            val encodedChildKey = DeterministicWallet.encode(DeterministicWallet.publicKey(userExtendedPrivateKey), testnet = chain != NodeParams.Chain.Mainnet)
+            val userKey = "[${masterFingerprint.toHex()}/${encodedSwapInUserKeyPath(chain)}]$encodedChildKey"
+            "wsh(and_v(v:pk($userKey),or_d(pk(${remoteServerPublicKey.toHex()}),older($refundDelay))))"
+        }
+
+        companion object {
+            /** When doing a swap-in, the user's funds are locked in a 2-of-2: they can claim them unilaterally after that delay. */
+            const val SwapInRefundDelay = 144 * 30 * 6 // ~6 months
+
+            private fun swapInKeyBasePath(chain: NodeParams.Chain) = when (chain) {
+                NodeParams.Chain.Regtest, NodeParams.Chain.Testnet -> KeyPath.empty / hardened(51) / hardened(0)
+                NodeParams.Chain.Mainnet -> KeyPath.empty / hardened(52) / hardened(0)
+            }
+
+            fun swapInUserKeyPath(chain: NodeParams.Chain) = swapInKeyBasePath(chain) / hardened(0)
+
+            fun swapInLocalServerKeyPath(chain: NodeParams.Chain) = swapInKeyBasePath(chain) / hardened(1)
+
+            fun encodedSwapInUserKeyPath(chain: NodeParams.Chain) = when (chain) {
+                NodeParams.Chain.Regtest, NodeParams.Chain.Testnet -> "51h/0h/0h"
+                NodeParams.Chain.Mainnet -> "52h/0h/0h"
+            }
+
+            /** Swap-in servers use a different swap-in key for different users. */
+            fun perUserPath(remoteNodeId: PublicKey): KeyPath {
+                // We hash the remote node_id and break it into 2-byte values to get non-hardened path indices.
+                val h = ByteArrayInput(Crypto.sha256(remoteNodeId.value))
+                return KeyPath((0 until 16).map { _ -> LightningCodecs.u16(h).toLong() })
+            }
+        }
+    }
+
 }

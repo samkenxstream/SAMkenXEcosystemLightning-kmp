@@ -11,7 +11,7 @@ import fr.acinq.lightning.Lightning.randomBytes
 import fr.acinq.lightning.Lightning.randomBytes32
 import fr.acinq.lightning.Lightning.randomBytes64
 import fr.acinq.lightning.Lightning.randomKey
-import fr.acinq.lightning.channel.Channel
+import fr.acinq.lightning.channel.states.Channel
 import fr.acinq.lightning.crypto.sphinx.Sphinx
 import fr.acinq.lightning.router.ChannelHop
 import fr.acinq.lightning.router.NodeHop
@@ -88,8 +88,7 @@ class PaymentPacketTestsCommon : LightningTestSuite() {
         )
 
         private fun testBuildOnion() {
-            val finalPayload =
-                PaymentOnion.FinalPayload(TlvStream(listOf(OnionPaymentPayloadTlv.AmountToForward(finalAmount), OnionPaymentPayloadTlv.OutgoingCltv(finalExpiry), OnionPaymentPayloadTlv.PaymentData(paymentSecret, finalAmount))))
+            val finalPayload = PaymentOnion.FinalPayload(TlvStream(OnionPaymentPayloadTlv.AmountToForward(finalAmount), OnionPaymentPayloadTlv.OutgoingCltv(finalExpiry), OnionPaymentPayloadTlv.PaymentData(paymentSecret, finalAmount)))
             val (firstAmount, firstExpiry, onion) = OutgoingPaymentPacket.buildPacket(paymentHash, hops, finalPayload, OnionRoutingPacket.PaymentPacketLength)
             assertEquals(amountAB, firstAmount)
             assertEquals(expiryAB, firstExpiry)
@@ -261,14 +260,12 @@ class PaymentPacketTestsCommon : LightningTestSuite() {
         val payloadE = IncomingPaymentPacket.decrypt(addE, privE).right!!
         val expectedFinalPayload = PaymentOnion.FinalPayload(
             TlvStream(
-                listOf(
                     OnionPaymentPayloadTlv.AmountToForward(finalAmount),
                     OnionPaymentPayloadTlv.OutgoingCltv(finalExpiry),
                     OnionPaymentPayloadTlv.PaymentData(paymentSecret, finalAmount * 3),
                     OnionPaymentPayloadTlv.PaymentMetadata(paymentMetadata)
                 )
             )
-        )
         assertEquals(payloadE, expectedFinalPayload)
     }
 
